@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b3d">
+  <title>StreamPulse — Library Analytics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="StreamPulse home">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" fill="none"><path d="M4 17h5l3-8 6 15 4-10 2 3h4" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </span>
+      <span class="brand-name">Stream<span>Pulse</span></span>
+    </a>
+    <div class="topbar-right">
+      <div class="refresh-note"><span class="pulse-dot" aria-hidden="true"></span> Refreshes every 10 seconds</div>
+      <div class="service-status" aria-label="Service status">
+        <span id="api-status" class="status-pill status-checking"><span class="status-dot"></span><span>API checking</span></span>
+        <span id="rabbit-status" class="service-label">RabbitMQ <b>Checking</b></span>
+        <span id="redis-status" class="service-label">Redis <b>Checking</b></span>
+      </div>
+    </div>
+  </header>
+
+  <main id="top" class="page-shell">
+    <section class="intro-row">
+      <div>
+        <p class="eyebrow">LIBRARY OPERATIONS · REAL-TIME ANALYTICS</p>
+        <h1>Your library,<br><span>in the moment.</span></h1>
+        <p class="intro-copy">Issue, return, and reserve books while StreamPulse turns each action into a live view of library activity.</p>
+      </div>
+      <aside class="intro-aside">
+        <div class="aside-icon" aria-hidden="true">↗</div>
+        <div><strong>Live event stream</strong><p>Actions publish through RabbitMQ and update rolling window metrics.</p></div>
+      </aside>
+    </section>
+
+    <section class="workspace-grid">
+      <section class="panel action-panel" aria-labelledby="actions-title">
+        <div class="panel-heading">
+          <div class="panel-icon violet" aria-hidden="true">⌁</div>
+          <div><p class="eyebrow">LIBRARY DESK</p><h2 id="actions-title">Library actions</h2></div>
+        </div>
+        <p class="panel-copy">Record a student’s book activity. Every valid action is published as one event.</p>
+
+        <form id="action-form" novalidate>
+          <label for="student-id">Student ID</label>
+          <input id="student-id" name="student_id" type="text" placeholder="e.g. STU-2048" autocomplete="off" required>
+          <label for="book-id">Book ID</label>
+          <input id="book-id" name="book_id" type="text" placeholder="e.g. BK-0315" autocomplete="off" required>
+          <div class="action-buttons">
+            <button class="action-button issue" type="submit" data-event-type="BOOK_ISSUED"><span aria-hidden="true">↗</span> Issue book</button>
+            <button class="action-button return" type="submit" data-event-type="BOOK_RETURNED"><span aria-hidden="true">↙</span> Return book</button>
+            <button class="action-button reserve" type="submit" data-event-type="BOOK_RESERVED"><span aria-hidden="true">＋</span> Reserve book</button>
+          </div>
+        </form>
+        <div id="action-message" class="message-box" role="status" aria-live="polite" hidden></div>
+        <div class="value-note"><span aria-hidden="true">i</span> Consumer processing latency is measured automatically in milliseconds.</div>
+      </section>
+
+      <section class="panel metrics-panel" aria-labelledby="metrics-title">
+        <div class="section-title-row">
+          <div class="panel-heading compact">
+            <div class="panel-icon aqua" aria-hidden="true">◷</div>
+            <div><p class="eyebrow">PROCESSING WINDOWS</p><h2 id="metrics-title">Live metrics</h2></div>
+          </div>
+          <span id="metrics-updated" class="updated-label">Loading…</span>
+        </div>
+        <div id="metrics-message" class="inline-message" role="status" aria-live="polite">Fetching latest metrics…</div>
+        <div class="metric-cards">
+          <article class="metric-card tumbling-card" data-window="tumbling">
+            <div class="metric-card-head"><span class="window-marker marker-tumbling"></span><h3>Tumbling</h3><span class="window-tag">FIXED</span></div>
+            <p class="window-description">Non-overlapping groups</p>
+            <div class="primary-metric"><strong data-metric="count">—</strong><span>events processed in window</span></div>
+            <dl class="metric-list">
+              <div><dt>Latency sum (ms)</dt><dd data-metric="sum">—</dd></div>
+              <div><dt>Average latency (ms)</dt><dd data-metric="average">—</dd></div>
+              <div><dt>Minimum latency (ms)</dt><dd data-metric="minimum">—</dd></div>
+              <div><dt>Maximum latency (ms)</dt><dd data-metric="maximum">—</dd></div>
+            </dl>
+            <p class="window-state" data-window-state>Waiting for first complete window</p>
+          </article>
+          <article class="metric-card sliding-card" data-window="sliding">
+            <div class="metric-card-head"><span class="window-marker marker-sliding"></span><h3>Sliding</h3><span class="window-tag">ROLLING</span></div>
+            <p class="window-description">Latest configured events</p>
+            <div class="primary-metric"><strong data-metric="count">—</strong><span>events processed in window</span></div>
+            <dl class="metric-list">
+              <div><dt>Latency sum (ms)</dt><dd data-metric="sum">—</dd></div>
+              <div><dt>Average latency (ms)</dt><dd data-metric="average">—</dd></div>
+              <div><dt>Minimum latency (ms)</dt><dd data-metric="minimum">—</dd></div>
+              <div><dt>Maximum latency (ms)</dt><dd data-metric="maximum">—</dd></div>
+            </dl>
+            <p class="window-state" data-window-state>Waiting for first event</p>
+          </article>
+        </div>
+      </section>
+    </section>
+
+    <section class="panel chart-panel" aria-labelledby="events-chart-title">
+      <div class="section-title-row chart-heading-row">
+        <div><p class="eyebrow">WINDOW COMPARISON</p><h2 id="events-chart-title">Events per Window</h2><p class="panel-copy">Event counts in the latest tumbling and sliding windows.</p></div>
+        <div class="chart-legend" aria-label="Chart legend"><span><i class="legend-dot tumbling-dot"></i>Tumbling</span><span><i class="legend-dot sliding-dot"></i>Sliding</span></div>
+      </div>
+      <div id="events-chart-message" class="chart-message">Waiting for API metrics&hellip;</div>
+      <div class="chart-wrap events-chart-wrap"><canvas id="events-chart" aria-label="Bar chart comparing event counts in tumbling and sliding windows" role="img"></canvas></div>
+      <p class="chart-footnote">Count is the number of events currently represented by each window.</p>
+    </section>
+
+    <section class="panel chart-panel" aria-labelledby="latency-chart-title">
+      <div class="section-title-row chart-heading-row">
+        <div><p class="eyebrow">PROCESSING LATENCY</p><h2 id="latency-chart-title">Consumer Latency Comparison (ms)</h2><p class="panel-copy">Compare summed, average, minimum, and maximum consumer latency for each window.</p></div>
+        <div class="chart-legend" aria-label="Chart legend"><span><i class="legend-dot tumbling-dot"></i>Tumbling</span><span><i class="legend-dot sliding-dot"></i>Sliding</span></div>
+      </div>
+      <div id="latency-chart-message" class="chart-message">Waiting for API metrics&hellip;</div>
+      <div class="chart-wrap latency-chart-wrap"><canvas id="latency-chart" aria-label="Bar chart comparing latency sum, average, minimum, and maximum in milliseconds" role="img"></canvas></div>
+      <p class="chart-footnote">Values are shown in milliseconds with source precision preserved for small measurements.</p>
+    </section>
+    <section class="panel events-panel" aria-labelledby="events-title">
+      <div class="section-title-row">
+        <div class="panel-heading compact">
+          <div class="panel-icon amber" aria-hidden="true">≋</div>
+          <div><p class="eyebrow">LATEST ACTIVITY</p><h2 id="events-title">Recent events</h2></div>
+        </div>
+        <span id="events-count" class="count-chip">— events</span>
+      </div>
+      <div id="events-message" class="inline-message">Loading recent events…</div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Event</th><th>Student</th><th>Book</th><th>Timestamp</th></tr></thead>
+          <tbody id="events-body"><tr class="placeholder-row"><td colspan="4">Fetching recent activity…</td></tr></tbody>
+        </table>
+      </div>
+      <p class="history-note">Recent history is held in API memory and clears when the backend restarts.</p>
+    </section>
+
+    <footer class="page-footer"><span>StreamPulse · Real-Time Library Analytics</span><span>Window counts show current window contents</span></footer>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" crossorigin="anonymous"></script>
+  <script src="app.js"></script>
+</body>
+</html>
