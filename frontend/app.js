@@ -16,12 +16,534 @@ const eventsBody = document.getElementById("events-body");
 const eventsCount = document.getElementById("events-count");
 const actionForm = document.getElementById("action-form");
 const actionMessage = document.getElementById("action-message");
+const sampleBatchSize = document.getElementById("sample-batch-size");
+const generateSampleEventsButton = document.getElementById("generate-sample-events");
+const sampleBatchMessage = document.getElementById("sample-batch-message");
+const architectureNodes = [...document.querySelectorAll(".architecture-node")];
+const architectureDetailTitle = document.getElementById("architecture-detail-title");
+const architectureDetailStatus = document.getElementById("architecture-detail-status");
+const architectureDetailDescription = document.getElementById("architecture-detail-description");
+const architectureDetailInformation = document.getElementById("architecture-detail-information");
+const windowConfigurationSection = document.getElementById("window-configuration");
+const activeWindowConfiguration = document.getElementById("active-window-configuration");
+const pendingWindowConfiguration = document.getElementById("pending-window-configuration");
+const windowConfigurationForm = document.getElementById("window-configuration-form");
+const tumblingWindowSizeSelect = document.getElementById("tumbling-window-size");
+const slidingWindowSizeSelect = document.getElementById("sliding-window-size");
+const slidingWindowIntervalSelect = document.getElementById("sliding-window-interval");
+const applyWindowConfigurationButton = document.getElementById("apply-window-configuration");
+const windowConfigurationMessage = document.getElementById("window-configuration-message");
 
 let activeRefresh = null;
 let refreshTimer = null;
 let eventsChart = null;
 let latencyChart = null;
 let latestMetrics = { tumbling: null, sliding: null };
+let metricsDataStatus = "loading";
+let architectureState = {
+  api: "checking",
+  dashboard: "checking",
+  rabbitmq: "not_verified",
+  redis: "not_verified",
+  consumer: "unavailable",
+  windows: "unavailable",
+};
+let architectureMonitoringStatus = "loading";
+let architectureMonitoringData = null;
+let architectureMonitoringUpdatedAt = null;
+let selectedArchitectureComponent = "generation";
+let windowConfigurationStatus = "loading";
+let windowConfigurationData = null;
+let windowConfigurationDirty = false;
+let windowConfigurationSubmitting = false;
+let windowConfigurationRequestId = 0;
+
+const architectureComponents = {
+  generation: {
+    name: "Library Event Generation",
+    description: "Library actions enter the event flow here. The manual action form publishes individual events through the existing API.",
+    status: () => "Manual available",
+    state: () => "available",
+    information: ["Manual Event Generation: available through the existing library actions form.", "On-demand Random Batch Producer: generates a finite sample batch through the same event publishing flow; it is an input method, not a separate processing service."],
+  },
+  rabbitmq: {
+    name: "CloudAMQP / RabbitMQ",
+    description: "The API publisher sends library events to the configured RabbitMQ queue. Queue counts are point-in-time observations from the existing AMQP connection.",
+    status: () => monitoringLoading() ? "Loading monitoring…" : monitoringFailed() ? "Monitoring unavailable" : architectureStatusLabel(architectureState.rabbitmq),
+    state: () => monitoringFailed() ? "monitoring-unavailable" : architectureState.rabbitmq,
+    information: rabbitmqInformation,
+  },
+  consumer: {
+    name: "Python Stream Processor / Consumer",
+    description: "A separate Python process consumes and validates queued events, then passes them into the window processor.",
+    status: consumerStatusLabel,
+    state: () => consumerStatusState(architectureMonitoringData?.consumer?.status),
+    information: consumerInformation,
+  },
+  windows: {
+    name: "Streaming Window Manager",
+    description: "The in-memory window managers summarize consumer events before the summaries are stored in Redis.",
+    status: windowStatusLabel,
+    state: () => consumerStatusState(architectureMonitoringData?.consumer?.status),
+    information: windowInformation,
+  },
+  redis: {
+    name: "Redis KV Store",
+    description: "Redis stores the latest window summaries and consumer monitoring snapshot. API-side monitoring reads and consumer-side aggregation writes are reported separately.",
+    status: redisStatusLabel,
+    state: redisStatusState,
+    information: redisInformation,
+  },
+  api: {
+    name: "FastAPI REST API",
+    description: "The API validates and publishes events, serves recent API-process event history, reads metrics, and reports health.",
+    status: () => architectureState.api === "connected" ? "Available" : architectureState.api === "disconnected" ? "Unavailable" : "Checking",
+    state: () => architectureState.api === "connected" ? "available" : architectureState.api,
+    information: ["Availability is based on the dashboard's monitoring request."],
+  },
+  dashboard: {
+    name: "Monitoring Dashboard",
+    description: "Connection to the StreamPulse API.",
+    status: () => architectureState.dashboard === "connected" ? "Connected" : architectureState.dashboard === "disconnected" ? "Disconnected" : "Checking",
+    state: () => architectureState.dashboard,
+    information: [],
+  },
+};
+
+function monitoringLoading() {
+  return architectureMonitoringStatus === "loading";
+}
+
+function monitoringFailed() {
+  return architectureMonitoringStatus === "error";
+}
+
+function monitoringUnavailableInformation() {
+  if (monitoringLoading()) return ["Loading component monitoring…"];
+  if (monitoringFailed()) return ["Monitoring data is unavailable because the latest monitoring request failed. No component failure is inferred from that request failure."];
+  return ["This component's monitoring data was not returned."];
+}
+
+function architectureStatusLabel(value) {
+  return ({
+    available: "Available",
+    unavailable: "Unavailable",
+    not_configured: "Not configured",
+    not_verified: "Not verified",
+    running: "Running",
+    stale: "Stale heartbeat",
+    stopped: "Stopped",
+    connected: "Connected",
+    disconnected: "Disconnected",
+  })[value] || "Not reported";
+}
+
+function displayMonitoringValue(value, suffix = "") {
+  if (value === null || value === undefined || value === "") return "Unavailable";
+  return `${String(value)}${suffix}`;
+}
+
+function displayMonitoringTimestamp(value) {
+  if (value === null || value === undefined || value === "") return "Unavailable";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Invalid timestamp" : date.toLocaleString();
+}
+
+function monitoringResponseUpdatedLine() {
+  return `Monitoring response updated: ${architectureMonitoringUpdatedAt?.toLocaleTimeString() || "Unavailable"}.`;
+}
+
+function staleSnapshotNote(consumer) {
+  if (consumer?.status === "stale") {
+    return `Heartbeat expired. Values below are from the last snapshot at ${displayMonitoringTimestamp(consumer.last_heartbeat)}.`;
+  }
+  if (consumer?.status === "stopped") {
+    return `The consumer reported a graceful stop. Values below are from its final snapshot at ${displayMonitoringTimestamp(consumer.last_heartbeat)}.`;
+  }
+  return null;
+}
+
+function rabbitmqInformation() {
+  if (monitoringLoading() || monitoringFailed()) return monitoringUnavailableInformation();
+  const rabbitmq = architectureMonitoringData?.rabbitmq;
+  if (!rabbitmq) return monitoringUnavailableInformation();
+  return [
+    `Connection / operation status: ${architectureStatusLabel(rabbitmq.status)}.`,
+    monitoringResponseUpdatedLine(),
+    `Queue name: ${displayMonitoringValue(rabbitmq.queue_name)}.`,
+    `Messages ready: ${displayMonitoringValue(rabbitmq.messages_ready)}.`,
+    `Consumer count: ${displayMonitoringValue(rabbitmq.consumer_count)}.`,
+    `Unacknowledged messages: ${rabbitmq.unacknowledged_messages == null ? "Unavailable" : rabbitmq.unacknowledged_messages}.`,
+    `Queue counts observed: ${displayMonitoringTimestamp(rabbitmq.counts_observed_at)}.`,
+  ];
+}
+
+function consumerStatusLabel() {
+  if (monitoringLoading()) return "Loading monitoring…";
+  if (monitoringFailed()) return "Monitoring unavailable";
+  const status = architectureMonitoringData?.consumer?.status;
+  return status === "unavailable" ? "Monitoring unavailable" : architectureStatusLabel(status);
+}
+
+function consumerStatusState(value) {
+  if (monitoringLoading()) return "checking";
+  if (monitoringFailed()) return "monitoring-unavailable";
+  return ({
+    running: "available",
+    stale: "stale",
+    stopped: "stopped",
+    unavailable: "monitoring-unavailable",
+  })[value] || "monitoring-unavailable";
+}
+
+function consumerInformation() {
+  if (monitoringLoading() || monitoringFailed()) return monitoringUnavailableInformation();
+  const consumer = architectureMonitoringData?.consumer;
+  if (!consumer) return monitoringUnavailableInformation();
+  const note = staleSnapshotNote(consumer);
+  const info = [];
+  if (note) info.push(note);
+  if (consumer.status === "unavailable") {
+    const reasons = {
+      not_initialized: "Consumer monitoring has not been initialized; this does not mean the consumer crashed.",
+      monitoring_not_configured: "Consumer monitoring is not configured.",
+      redis_unavailable: "The API could not read consumer monitoring data from Redis.",
+      invalid_snapshot: "The stored consumer monitoring snapshot is invalid.",
+    };
+    info.push(reasons[consumer.reason] || "Consumer monitoring data is unavailable; consumer state is not confirmed.");
+  }
+  info.push(monitoringResponseUpdatedLine());
+  info.push(`Last heartbeat: ${displayMonitoringTimestamp(consumer.last_heartbeat)}.`);
+  info.push(`Processed since startup: ${displayMonitoringValue(consumer.processed_since_start)}.`);
+  info.push(`Processing failures since startup: ${displayMonitoringValue(consumer.processing_failures_since_start)}.`);
+  info.push(`Consumer-side Redis write status: ${architectureStatusLabel(consumer.redis_status)}.`);
+  info.push(`Last successful aggregation write: ${displayMonitoringTimestamp(consumer.last_successful_aggregation_write)}.`);
+  return info;
+}
+
+function windowStatusLabel() {
+  if (monitoringLoading()) return "Loading monitoring…";
+  if (monitoringFailed()) return "Monitoring unavailable";
+  const status = architectureMonitoringData?.consumer?.status;
+  if (status === "running") return "Fresh snapshot";
+  if (status === "stale") return "Stale snapshot";
+  if (status === "stopped") return "Final stopped snapshot";
+  return "Window data unavailable";
+}
+
+function windowInformation() {
+  if (monitoringLoading() || monitoringFailed()) return monitoringUnavailableInformation();
+  const consumer = architectureMonitoringData?.consumer;
+  const windows = consumer?.windows;
+  if (!windows) return monitoringUnavailableInformation();
+  const tumbling = windows.tumbling || {};
+  const sliding = windows.sliding || {};
+  const info = [];
+  const note = staleSnapshotNote(consumer);
+  if (note) info.push(note);
+  else info.push(`Monitoring heartbeat: ${displayMonitoringTimestamp(consumer.last_heartbeat)}.`);
+  info.push(monitoringResponseUpdatedLine());
+  info.push(`Tumbling window size: ${displayMonitoringValue(tumbling.size, " events")} · progress: ${displayMonitoringValue(tumbling.progress)}.`);
+  info.push(`Sliding window size: ${displayMonitoringValue(sliding.size, " events")} · progress: ${displayMonitoringValue(sliding.progress)}.`);
+  info.push(`Sliding interval: ${sliding.interval === "per_event" ? "Per event" : displayMonitoringValue(sliding.interval)}.`);
+  info.push(`Last completed tumbling aggregation: ${displayMonitoringTimestamp(tumbling.last_completed_at)}.`);
+  return info;
+}
+
+function isValidWindowConfiguration(configuration) {
+  if (!configuration || typeof configuration !== "object") return false;
+  const sizes = [5, 8, 10];
+  return sizes.includes(configuration.tumbling_size)
+    && sizes.includes(configuration.sliding_size)
+    && Number.isInteger(configuration.sliding_interval)
+    && configuration.sliding_interval > 0
+    && configuration.sliding_interval < configuration.sliding_size;
+}
+
+function validateConfigurationResponse(data) {
+  if (!data || !isValidWindowConfiguration(data.active)) {
+    throw new Error("The configuration response did not include a valid active configuration.");
+  }
+  if (data.pending !== null && !isValidWindowConfiguration(data.pending)) {
+    throw new Error("The configuration response included an invalid pending configuration.");
+  }
+  const expectedStatus = data.pending === null ? "active" : "pending";
+  if (data.status !== expectedStatus) {
+    throw new Error("The configuration response status did not match its active and pending values.");
+  }
+  return { active: data.active, pending: data.pending, status: expectedStatus };
+}
+
+function describeWindowConfiguration(configuration) {
+  const interval = configuration.sliding_interval === 1
+    ? "Per event"
+    : `Every ${configuration.sliding_interval} events`;
+  return `Tumbling: ${configuration.tumbling_size} events · Sliding: ${configuration.sliding_size} events · Interval: ${interval}`;
+}
+
+function setWindowConfigurationMessage(message, kind = "") {
+  windowConfigurationMessage.textContent = message;
+  windowConfigurationMessage.className = `configuration-message${kind ? ` ${kind}` : ""}`;
+}
+
+function updateSlidingIntervalOptions(size, preferredValue = null) {
+  const previousValue = Number(slidingWindowIntervalSelect.value);
+  const intervalToSelect = Number(preferredValue ?? previousValue);
+  const selectedInterval = Number.isInteger(intervalToSelect) && intervalToSelect > 0 && intervalToSelect < size
+    ? intervalToSelect
+    : 1;
+  const options = [];
+  for (let interval = 1; interval < size; interval += 1) {
+    const option = document.createElement("option");
+    option.value = String(interval);
+    option.textContent = interval === 1 ? "Every event" : `Every ${interval} events`;
+    options.push(option);
+  }
+  slidingWindowIntervalSelect.replaceChildren(...options);
+  slidingWindowIntervalSelect.value = String(selectedInterval);
+}
+
+function populateWindowConfigurationForm(configuration) {
+  tumblingWindowSizeSelect.value = String(configuration.tumbling_size);
+  slidingWindowSizeSelect.value = String(configuration.sliding_size);
+  updateSlidingIntervalOptions(configuration.sliding_size, configuration.sliding_interval);
+}
+
+function renderWindowConfiguration() {
+  const isWindowComponentSelected = selectedArchitectureComponent === "windows";
+  windowConfigurationSection.hidden = !isWindowComponentSelected;
+
+  if (windowConfigurationStatus === "loading" && !windowConfigurationData) {
+    activeWindowConfiguration.textContent = "Loading configuration…";
+    pendingWindowConfiguration.textContent = "Loading configuration…";
+  } else if (windowConfigurationStatus === "error" || !windowConfigurationData) {
+    activeWindowConfiguration.textContent = "Unavailable";
+    pendingWindowConfiguration.textContent = "Unavailable";
+  } else {
+    activeWindowConfiguration.textContent = describeWindowConfiguration(windowConfigurationData.active);
+    pendingWindowConfiguration.textContent = windowConfigurationData.pending
+      ? `${describeWindowConfiguration(windowConfigurationData.pending)} · Waiting for the tumbling boundary`
+      : "None · The active configuration is in use";
+  }
+
+  const canEdit = windowConfigurationStatus === "available" && Boolean(windowConfigurationData);
+  tumblingWindowSizeSelect.disabled = !canEdit || windowConfigurationSubmitting;
+  slidingWindowSizeSelect.disabled = !canEdit || windowConfigurationSubmitting;
+  slidingWindowIntervalSelect.disabled = !canEdit || windowConfigurationSubmitting;
+  applyWindowConfigurationButton.disabled = !canEdit || windowConfigurationSubmitting;
+  applyWindowConfigurationButton.textContent = windowConfigurationSubmitting
+    ? "Saving Configuration…"
+    : "Apply Configuration";
+}
+
+async function loadWindowConfiguration({ announce = false } = {}) {
+  const requestId = ++windowConfigurationRequestId;
+  const previousStatus = windowConfigurationStatus;
+  if (!windowConfigurationData) {
+    windowConfigurationStatus = "loading";
+    setWindowConfigurationMessage("Loading saved configuration…", "loading");
+    renderWindowConfiguration();
+  }
+
+  try {
+    const configuration = validateConfigurationResponse(await getJson("/api/config"));
+    if (requestId !== windowConfigurationRequestId) return false;
+    windowConfigurationData = configuration;
+    windowConfigurationStatus = "available";
+    if (!windowConfigurationDirty && !windowConfigurationSubmitting) {
+      populateWindowConfigurationForm(configuration.pending || configuration.active);
+    }
+    if (announce || previousStatus !== "available") {
+      setWindowConfigurationMessage("Configuration loaded from the API.");
+    }
+    renderWindowConfiguration();
+    return true;
+  } catch (error) {
+    if (requestId !== windowConfigurationRequestId) return false;
+    windowConfigurationData = null;
+    windowConfigurationStatus = "error";
+    setWindowConfigurationMessage(`Configuration unavailable: ${error.message}`, "error");
+    renderWindowConfiguration();
+    return false;
+  }
+}
+
+async function submitWindowConfiguration(event) {
+  event.preventDefault();
+  if (windowConfigurationSubmitting || windowConfigurationStatus !== "available") return;
+
+  const configuration = {
+    tumbling_size: Number(tumblingWindowSizeSelect.value),
+    sliding_size: Number(slidingWindowSizeSelect.value),
+    sliding_interval: Number(slidingWindowIntervalSelect.value),
+  };
+  if (!isValidWindowConfiguration(configuration)) {
+    setWindowConfigurationMessage("Choose valid window sizes and an interval smaller than the sliding size.", "error");
+    return;
+  }
+
+  windowConfigurationSubmitting = true;
+  setWindowConfigurationMessage("Saving as pending configuration…", "loading");
+  renderWindowConfiguration();
+  let saved = false;
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/config`, {
+      method: "PUT",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify(configuration),
+    });
+    let body;
+    try { body = await response.json(); } catch { body = null; }
+    if (!response.ok) {
+      throw new Error(typeof body?.detail === "string" ? body.detail : `Request failed (${response.status}).`);
+    }
+    validateConfigurationResponse(body);
+    saved = true;
+    windowConfigurationDirty = false;
+    setWindowConfigurationMessage("Configuration saved. Refreshing active and pending status…", "loading");
+    const refreshed = await loadWindowConfiguration({ announce: true });
+    if (!refreshed) {
+      setWindowConfigurationMessage("Configuration was saved, but its latest active/pending status could not be refreshed.", "error");
+    } else if (windowConfigurationData.pending) {
+      setWindowConfigurationMessage("Configuration saved as pending. It will activate after the current tumbling window completes.", "success");
+    } else {
+      setWindowConfigurationMessage("Configuration status refreshed from the API.", "success");
+    }
+  } catch (error) {
+    setWindowConfigurationMessage(
+      saved
+        ? `Configuration was saved, but its status could not be confirmed: ${error.message}`
+        : `Could not save configuration: ${error.message}`,
+      "error",
+    );
+  } finally {
+    windowConfigurationSubmitting = false;
+    if (windowConfigurationData && !windowConfigurationDirty) {
+      populateWindowConfigurationForm(windowConfigurationData.pending || windowConfigurationData.active);
+    }
+    renderWindowConfiguration();
+  }
+}
+
+function redisStatusLabel() {
+  if (monitoringLoading()) return "Loading monitoring…";
+  if (monitoringFailed()) return "Monitoring unavailable";
+  const apiStatus = architectureMonitoringData?.api?.redis_status;
+  const consumerStatus = architectureMonitoringData?.consumer?.redis_status;
+  const consumer = architectureMonitoringData?.consumer;
+  const consumerQualifier = consumer?.status === "stale"
+    ? " (stale snapshot)"
+    : consumer?.status === "stopped" ? " (final snapshot)" : "";
+  return `API: ${architectureStatusLabel(apiStatus)} · Consumer${consumerQualifier}: ${architectureStatusLabel(consumerStatus)}`;
+}
+
+function redisStatusState() {
+  if (monitoringLoading()) return "checking";
+  if (monitoringFailed()) return "monitoring-unavailable";
+  const apiStatus = architectureMonitoringData?.api?.redis_status;
+  const consumerStatus = architectureMonitoringData?.consumer?.redis_status;
+  if (apiStatus === "unavailable" || consumerStatus === "unavailable") return "unavailable";
+  if (apiStatus === "available" && consumerStatus === "available") return "available";
+  return "not_verified";
+}
+
+function redisInformation() {
+  if (monitoringLoading() || monitoringFailed()) return monitoringUnavailableInformation();
+  const data = architectureMonitoringData;
+  if (!data) return monitoringUnavailableInformation();
+  const consumer = data.consumer || {};
+  const info = [
+    `API-observed Redis status: ${architectureStatusLabel(data.api?.redis_status)}.`,
+    monitoringResponseUpdatedLine(),
+  ];
+  const note = staleSnapshotNote(consumer);
+  if (note) info.push(`Consumer-side status is from that snapshot. ${note}`);
+  else info.push(`Consumer monitoring heartbeat: ${displayMonitoringTimestamp(consumer.last_heartbeat)}.`);
+  info.push(`Consumer-side aggregation write status: ${architectureStatusLabel(consumer.redis_status)}.`);
+  info.push(`Last successful consumer-side aggregation write: ${displayMonitoringTimestamp(consumer.last_successful_aggregation_write)}.`);
+  return info;
+}
+
+function renderArchitectureDetail() {
+  const component = architectureComponents[selectedArchitectureComponent];
+  if (!component) return;
+  const state = typeof component.state === "function" ? component.state() : "";
+  architectureDetailTitle.textContent = component.name;
+  architectureDetailStatus.textContent = component.status();
+  architectureDetailStatus.dataset.state = state;
+  architectureDetailDescription.textContent = component.description;
+  const information = typeof component.information === "function" ? component.information() : component.information;
+  architectureDetailInformation.replaceChildren();
+  information.forEach((item) => {
+    const entry = document.createElement("li");
+    entry.textContent = item;
+    architectureDetailInformation.append(entry);
+  });
+  renderWindowConfiguration();
+}
+
+function renderArchitectureStatuses() {
+  const rabbitmqStatus = monitoringLoading()
+    ? "Loading monitoring…"
+    : monitoringFailed() ? "Monitoring unavailable" : architectureStatusLabel(architectureMonitoringData?.rabbitmq?.status);
+  const consumerStatus = consumerStatusLabel();
+  const windows = architectureMonitoringData?.consumer?.windows;
+  const windowsStatus = monitoringLoading()
+    ? "Loading monitoring…"
+    : monitoringFailed() ? "Monitoring unavailable"
+      : architectureMonitoringData?.consumer?.status === "running" && windows
+        ? `Tumbling ${displayMonitoringValue(windows.tumbling?.progress)}/${displayMonitoringValue(windows.tumbling?.size)} · Sliding ${displayMonitoringValue(windows.sliding?.progress)}/${displayMonitoringValue(windows.sliding?.size)}`
+        : windowStatusLabel();
+  const redisStatus = redisStatusLabel();
+  const labels = {
+    generation: "Manual + batch available",
+    rabbitmq: rabbitmqStatus,
+    consumer: consumerStatus,
+    windows: windowsStatus,
+    redis: redisStatus,
+    api: architectureState.api === "connected" ? "Available" : architectureState.api === "disconnected" ? "Unavailable" : "Checking",
+    dashboard: architectureState.dashboard === "connected" ? "Connected" : architectureState.dashboard === "disconnected" ? "Disconnected" : "Checking",
+  };
+  const states = {
+    generation: "available",
+    rabbitmq: monitoringLoading() ? "checking" : monitoringFailed() ? "monitoring-unavailable" : architectureMonitoringData?.rabbitmq?.status || "not_verified",
+    consumer: consumerStatusState(architectureMonitoringData?.consumer?.status),
+    windows: consumerStatusState(architectureMonitoringData?.consumer?.status),
+    redis: redisStatusState(),
+    api: architectureState.api === "connected" ? "available" : architectureState.api,
+    dashboard: architectureState.dashboard,
+  };
+  Object.entries(labels).forEach(([name, label]) => {
+    const status = document.querySelector(`[data-node-status="${name}"]`);
+    if (status) {
+      status.textContent = label;
+      status.dataset.nodeState = states[name];
+    }
+  });
+  renderArchitectureDetail();
+}
+
+architectureNodes.forEach((node) => node.addEventListener("click", () => {
+  selectedArchitectureComponent = node.dataset.component;
+  architectureNodes.forEach((item) => item.setAttribute("aria-pressed", String(item === node)));
+  renderArchitectureDetail();
+}));
+function markWindowConfigurationDirty() {
+  windowConfigurationDirty = true;
+  setWindowConfigurationMessage("Unsaved selections. Apply them to save as pending configuration.");
+  renderWindowConfiguration();
+}
+
+tumblingWindowSizeSelect.addEventListener("change", markWindowConfigurationDirty);
+slidingWindowSizeSelect.addEventListener("change", () => {
+  updateSlidingIntervalOptions(Number(slidingWindowSizeSelect.value));
+  markWindowConfigurationDirty();
+});
+slidingWindowIntervalSelect.addEventListener("change", markWindowConfigurationDirty);
+windowConfigurationForm.addEventListener("submit", submitWindowConfiguration);
+updateSlidingIntervalOptions(Number(slidingWindowSizeSelect.value), 1);
+renderArchitectureStatuses();
 
 function formatNumber(value) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return "-";
@@ -65,23 +587,49 @@ async function getJson(path) {
   return body;
 }
 
-async function loadHealth() {
+async function loadMonitoring() {
   try {
-    const health = await getJson("/api/health");
-    const online = health?.status === "available";
+    const data = await getJson("/api/monitoring");
+    if (!data || !data.api || !data.rabbitmq || !data.consumer) {
+      throw new Error("The monitoring response did not contain component status data.");
+    }
+    architectureMonitoringData = data;
+    architectureMonitoringStatus = "available";
+    architectureMonitoringUpdatedAt = new Date();
+    const online = data.api.status === "available";
+    architectureState.api = online ? "connected" : "disconnected";
+    // A successful monitoring response confirms this dashboard can reach the API.
+    architectureState.dashboard = "connected";
+    architectureState.rabbitmq = ["available", "unavailable", "not_configured", "not_verified"].includes(data.rabbitmq.status)
+      ? data.rabbitmq.status
+      : "not_verified";
+    architectureState.redis = ["available", "unavailable", "not_configured", "not_verified"].includes(data.api.redis_status)
+      ? data.api.redis_status
+      : "not_verified";
     setApiStatus(online, online ? "API online" : "API unavailable");
-    setServiceStatus(rabbitStatus, "RabbitMQ", health?.services?.rabbitmq);
-    setServiceStatus(redisStatus, "Redis", health?.services?.redis);
+    setServiceStatus(rabbitStatus, "RabbitMQ", architectureState.rabbitmq);
+    setServiceStatus(redisStatus, "Redis", architectureState.redis);
+    renderArchitectureStatuses();
     return online;
   } catch {
+    architectureMonitoringData = null;
+    architectureMonitoringStatus = "error";
+    architectureMonitoringUpdatedAt = null;
+    architectureState.api = "disconnected";
+    architectureState.dashboard = "disconnected";
+    architectureState.rabbitmq = "not_verified";
+    architectureState.redis = "not_verified";
     setApiStatus(false, "API unavailable");
-    setServiceStatus(rabbitStatus, "RabbitMQ", "unavailable");
-    setServiceStatus(redisStatus, "Redis", "unavailable");
+    // A failed API monitoring request does not prove that RabbitMQ or Redis is down.
+    setServiceStatus(rabbitStatus, "RabbitMQ", "not_verified");
+    setServiceStatus(redisStatus, "Redis", "not_verified");
+    renderArchitectureStatuses();
     return false;
   }
 }
 
 function showMetricsUnavailable(message) {
+  metricsDataStatus = "unavailable";
   latestMetrics = { tumbling: null, sliding: null };
   document.querySelectorAll(".metric-card").forEach((card) => {
     card.querySelectorAll("[data-metric]").forEach((field) => { field.textContent = "-"; });
@@ -118,6 +666,7 @@ async function loadMetrics() {
       throw new Error("The metrics response did not contain both windows.");
     }
     latestMetrics = { tumbling: data.tumbling, sliding: data.sliding };
+    metricsDataStatus = "available";
     for (const windowType of ["tumbling", "sliding"]) {
       const metrics = latestMetrics[windowType];
       if (metrics) renderMetricCard(windowType, metrics);
@@ -136,7 +685,6 @@ async function loadMetrics() {
     updateCharts();
   } catch (error) {
     showMetricsUnavailable(`Live metrics unavailable: ${error.message}`);
-    setServiceStatus(redisStatus, "Redis", "unavailable");
   }
 }
 
@@ -153,10 +701,22 @@ function updateOneChart(existingChart, canvasId, messageElement, labels, metricN
   };
   const values = [windowValues("tumbling"), windowValues("sliding")];
   const hasData = values.some((series) => series.some((value) => value !== null));
-  messageElement.textContent = hasData
-    ? "Showing values returned by the metrics API. Missing window values are left blank."
-    : "No values are available for this chart yet.";
+  const canvas = document.getElementById(canvasId);
+  const chartWrap = canvas?.parentElement;
+  if (!hasData) {
+    messageElement.textContent = metricsDataStatus === "unavailable"
+      ? "Chart data unavailable because the latest metrics request failed."
+      : metricsDataStatus === "loading"
+        ? "Waiting for metrics data."
+        : "No metric values have been stored for this chart yet.";
+    messageElement.className = metricsDataStatus === "unavailable" ? "chart-message error" : "chart-message empty";
+    if (chartWrap) chartWrap.hidden = true;
+    if (existingChart) existingChart.destroy();
+    return null;
+  }
+  messageElement.textContent = "Showing values returned by the metrics API. Missing values are left blank.";
   messageElement.className = "chart-message";
+  if (chartWrap) chartWrap.hidden = false;
   const data = {
     labels,
     datasets: [
@@ -180,17 +740,17 @@ function updateOneChart(existingChart, canvasId, messageElement, labels, metricN
       x: {
         grid: { display: false },
         title: { display: true, text: "Window", color: "#738098", font: { family: "DM Sans", size: 12, weight: "600" } },
-        ticks: { color: "#59647c", font: { family: "DM Sans", size: 11 } },
+        ticks: { color: "#59647c", maxRotation: 0, font: { family: "DM Sans", size: 11 } },
       },
       y: {
         beginAtZero: true,
         grid: { color: "#edf0f5" },
         title: { display: true, text: axisTitle, color: "#738098", font: { family: "DM Sans", size: 12, weight: "600" } },
-        ticks: { color: "#59647c", font: { family: "DM Sans", size: 11 }, callback: formatter },
+        ticks: { color: "#59647c", maxTicksLimit: 5, font: { family: "DM Sans", size: 10 }, callback: formatter },
       },
     },
   };
-  if (!existingChart) return new Chart(document.getElementById(canvasId), { type: "bar", data, options });
+  if (!existingChart) return new Chart(canvas, { type: "bar", data, options });
   existingChart.data = data;
   existingChart.options = options;
   existingChart.update();
@@ -266,7 +826,12 @@ async function loadEvents() {
 
 async function refreshLiveData() {
   if (activeRefresh) return activeRefresh;
-  activeRefresh = Promise.allSettled([loadHealth(), loadMetrics(), loadEvents()]);
+  activeRefresh = Promise.allSettled([
+    loadMonitoring(),
+    loadMetrics(),
+    loadEvents(),
+    loadWindowConfiguration(),
+  ]);
   try {
     await activeRefresh;
   } finally {
@@ -288,6 +853,59 @@ function showActionMessage(message, kind) {
   actionMessage.className = `message-box ${kind}`;
   actionMessage.hidden = false;
 }
+
+function showSampleBatchMessage(message, kind) {
+  sampleBatchMessage.textContent = message;
+  sampleBatchMessage.className = `message-box ${kind}`;
+  sampleBatchMessage.hidden = false;
+}
+
+generateSampleEventsButton.addEventListener("click", async () => {
+  if (generateSampleEventsButton.disabled) return;
+  const requested = Number(sampleBatchSize.value);
+  if (![5, 8, 10].includes(requested)) {
+    showSampleBatchMessage("Choose a batch size of 5, 8, or 10 events.", "error");
+    return;
+  }
+
+  generateSampleEventsButton.disabled = true;
+  generateSampleEventsButton.textContent = "Generating…";
+  showSampleBatchMessage(`Publishing a finite batch of ${requested} events…`, "loading");
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/events/batch`, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ batch_size: requested }),
+    });
+    let result;
+    try { result = await response.json(); } catch { result = null; }
+    if (!response.ok) {
+      throw new Error(typeof result?.detail === "string" ? result.detail : `Batch request failed (${response.status}).`);
+    }
+    if (!result
+        || result.requested !== requested
+        || !Number.isInteger(result.published)
+        || !Number.isInteger(result.failed)
+        || !Array.isArray(result.failures)
+        || result.published + result.failed !== result.requested) {
+      throw new Error("The API returned an invalid batch result.");
+    }
+
+    const failedEvents = result.failures.map((failure) => `#${failure.event_number}`).join(", ");
+    const summary = `Published ${result.published} of ${result.requested} sample events; ${result.failed} failed.`;
+    showSampleBatchMessage(
+      failedEvents ? `${summary} Failed event numbers: ${failedEvents}.` : summary,
+      result.failed === 0 ? "success" : result.published === 0 ? "error" : "partial",
+    );
+    await refreshLiveData();
+  } catch (error) {
+    showSampleBatchMessage(`Could not complete sample batch: ${error.message}`, "error");
+  } finally {
+    generateSampleEventsButton.disabled = false;
+    generateSampleEventsButton.textContent = "Generate Sample Events";
+  }
+});
 
 actionForm.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-event-type]");

@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=dashboard-polish-2">
 </head>
 <body>
   <header class="topbar">
@@ -61,6 +61,25 @@
           </div>
         </form>
         <div id="action-message" class="message-box" role="status" aria-live="polite" hidden></div>
+        <div class="sample-batch-panel" aria-labelledby="sample-batch-title">
+          <div class="sample-batch-heading">
+            <div>
+              <p class="eyebrow">ON-DEMAND INPUT</p>
+              <h3 id="sample-batch-title">Sample event batch</h3>
+            </div>
+            <span class="sample-batch-limit">Up to 10 events · max 10 per second</span>
+          </div>
+          <div class="sample-batch-controls">
+            <label for="sample-batch-size">Batch size</label>
+            <select id="sample-batch-size" name="batch_size">
+              <option value="5">5 events</option>
+              <option value="8" selected>8 events</option>
+              <option value="10">10 events</option>
+            </select>
+            <button id="generate-sample-events" class="action-button sample-batch-button" type="button">Generate Sample Events</button>
+          </div>
+          <div id="sample-batch-message" class="message-box" role="status" aria-live="polite" hidden></div>
+        </div>
         <div class="value-note"><span aria-hidden="true">i</span> Consumer processing latency is measured automatically in milliseconds.</div>
       </section>
 
@@ -137,6 +156,96 @@
         </table>
       </div>
       <p class="history-note">Recent history is held in API memory and clears when the backend restarts.</p>
+    </section>
+
+    <section class="panel architecture-panel" aria-labelledby="architecture-title">
+      <div class="section-title-row chart-heading-row">
+        <div>
+          <p class="eyebrow">SYSTEM OVERVIEW</p>
+          <h2 id="architecture-title">System Architecture Simulation</h2>
+          <p class="panel-copy">Explore the existing event path and the status information currently available to this dashboard.</p>
+        </div>
+      </div>
+      <div class="architecture-flow" role="group" aria-label="StreamPulse event processing architecture">
+        <button class="architecture-node" type="button" data-component="generation" aria-pressed="true" aria-controls="architecture-detail" aria-label="Library Event Generation. Manual event generation and on-demand random batch generation available.">
+          <span class="architecture-node-icon" aria-hidden="true">✦</span><span class="architecture-node-content"><span class="architecture-node-title">Library Event Generation</span><span class="architecture-node-description">Manual actions and finite on-demand random event batches enter the same publishing flow.</span><span class="architecture-node-subtitle" data-node-status="generation">Manual + batch available</span></span>
+        </button><span class="architecture-arrow" aria-hidden="true">↓</span>
+        <button class="architecture-node" type="button" data-component="rabbitmq" aria-pressed="false" aria-controls="architecture-detail" aria-label="CloudAMQP / RabbitMQ">
+          <span class="architecture-node-icon" aria-hidden="true">↔</span><span class="architecture-node-content"><span class="architecture-node-title">CloudAMQP / RabbitMQ</span><span class="architecture-node-description">Durable queue carries published library events to the consumer.</span><span class="architecture-node-subtitle" data-node-status="rabbitmq">Checking</span></span>
+        </button><span class="architecture-arrow" aria-hidden="true">↓</span>
+        <button class="architecture-node" type="button" data-component="consumer" aria-pressed="false" aria-controls="architecture-detail" aria-label="Python Stream Processor / Consumer">
+          <span class="architecture-node-icon" aria-hidden="true">⌘</span><span class="architecture-node-content"><span class="architecture-node-title">Python Stream Processor / Consumer</span><span class="architecture-node-description">Separate Python process consumes, validates, and processes queued events.</span><span class="architecture-node-subtitle" data-node-status="consumer">Monitoring not instrumented</span></span>
+        </button><span class="architecture-arrow" aria-hidden="true">↓</span>
+        <button class="architecture-node" type="button" data-component="windows" aria-pressed="false" aria-controls="architecture-detail" aria-label="Streaming Window Manager">
+          <span class="architecture-node-icon" aria-hidden="true">▥</span><span class="architecture-node-content"><span class="architecture-node-title">Streaming Window Manager</span><span class="architecture-node-description">In-memory tumbling and sliding windows summarize processed events.</span><span class="architecture-node-subtitle" data-node-status="windows">Configuration available</span></span>
+        </button><span class="architecture-arrow" aria-hidden="true">↓</span>
+        <button class="architecture-node" type="button" data-component="redis" aria-pressed="false" aria-controls="architecture-detail" aria-label="Redis KV Store">
+          <span class="architecture-node-icon" aria-hidden="true">▤</span><span class="architecture-node-content"><span class="architecture-node-title">Redis KV Store</span><span class="architecture-node-description">Stores the latest available tumbling and sliding metric summaries.</span><span class="architecture-node-subtitle" data-node-status="redis">Checking</span></span>
+        </button><span class="architecture-arrow" aria-hidden="true">↓</span>
+        <button class="architecture-node" type="button" data-component="api" aria-pressed="false" aria-controls="architecture-detail" aria-label="FastAPI REST API">
+          <span class="architecture-node-icon" aria-hidden="true">⌁</span><span class="architecture-node-content"><span class="architecture-node-title">FastAPI REST API</span><span class="architecture-node-description">Serves health, recent events, and stored metrics to the dashboard.</span><span class="architecture-node-subtitle" data-node-status="api">Checking</span></span>
+        </button><span class="architecture-arrow" aria-hidden="true">↓</span>
+        <button class="architecture-node" type="button" data-component="dashboard" aria-pressed="false" aria-controls="architecture-detail" aria-label="Monitoring Dashboard">
+          <span class="architecture-node-icon" aria-hidden="true">▦</span><span class="architecture-node-content"><span class="architecture-node-title">Monitoring Dashboard</span><span class="architecture-node-description">This view displays the metrics, activity, and service information returned by the API.</span><span class="architecture-node-subtitle" data-node-status="dashboard">Checking</span></span>
+        </button>
+      </div>
+      <section id="architecture-detail" class="architecture-detail" aria-live="polite" aria-labelledby="architecture-detail-title">
+        <div class="architecture-detail-heading">
+          <div><p class="eyebrow">COMPONENT DETAILS</p><h3 id="architecture-detail-title">Library Event Generation</h3></div>
+          <span id="architecture-detail-status" class="architecture-status">Manual available</span>
+        </div>
+        <p id="architecture-detail-description" class="architecture-detail-copy"></p>
+        <ul id="architecture-detail-information" class="architecture-information"></ul>
+        <section id="window-configuration" class="window-configuration" aria-labelledby="window-configuration-title" hidden>
+          <div class="window-configuration-heading">
+            <div>
+              <p class="eyebrow">PROCESSING SETTINGS</p>
+              <h4 id="window-configuration-title">Window Configuration</h4>
+            </div>
+            <span class="configuration-note">Changes activate at the next completed tumbling window</span>
+          </div>
+          <div class="configuration-state-grid" aria-live="polite">
+            <article class="configuration-state-card active-configuration-card">
+              <h5>Active Configuration</h5>
+              <span class="configuration-state-caption">Currently used by the consumer</span>
+              <p id="active-window-configuration">Loading configuration…</p>
+            </article>
+            <article class="configuration-state-card pending-configuration-card">
+              <h5>Pending Configuration</h5>
+              <span class="configuration-state-caption">Saved and waiting for a tumbling boundary</span>
+              <p id="pending-window-configuration">Loading configuration…</p>
+            </article>
+          </div>
+          <form id="window-configuration-form" class="window-configuration-form" novalidate>
+            <div class="configuration-fields">
+              <div class="configuration-field">
+                <label for="tumbling-window-size">Tumbling window size</label>
+                <select id="tumbling-window-size" name="tumbling_size" required disabled>
+                  <option value="5">5 events</option>
+                  <option value="8">8 events</option>
+                  <option value="10">10 events</option>
+                </select>
+              </div>
+              <div class="configuration-field">
+                <label for="sliding-window-size">Sliding window size</label>
+                <select id="sliding-window-size" name="sliding_size" required disabled>
+                  <option value="5">5 events</option>
+                  <option value="8">8 events</option>
+                  <option value="10">10 events</option>
+                </select>
+              </div>
+              <div class="configuration-field">
+                <label for="sliding-window-interval">Sliding interval</label>
+                <select id="sliding-window-interval" name="sliding_interval" required disabled></select>
+              </div>
+            </div>
+            <div class="configuration-submit-row">
+              <p id="window-configuration-message" class="configuration-message" role="status" aria-live="polite">Loading saved configuration…</p>
+              <button id="apply-window-configuration" class="configuration-apply-button" type="submit" disabled>Apply Configuration</button>
+            </div>
+          </form>
+        </section>
+      </section>
     </section>
 
     <footer class="page-footer"><span>StreamPulse · Real-Time Library Analytics</span><span>Window counts show current window contents</span></footer>

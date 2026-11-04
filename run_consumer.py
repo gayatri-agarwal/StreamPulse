@@ -1,10 +1,12 @@
 """Run the StreamPulse RabbitMQ consumer as a separate process."""
 
 import asyncio
+import logging
 from typing import Tuple
 
 from app.messaging.rabbitmq import RabbitMQConsumer, RabbitMQSettings
 from app.processing.event_processor import LibraryEventProcessor
+from app.processing.window_config import WindowConfiguration
 from app.processing.window_manager import SlidingWindow, TumblingWindow
 from app.storage.redis_metrics import RedisMetricsStore
 
@@ -13,23 +15,40 @@ from app.storage.redis_metrics import RedisMetricsStore
 # summarizes the latest 5 events after every arrival (including partial groups).
 TUMBLING_WINDOW_SIZE = 10
 SLIDING_WINDOW_SIZE = 5
+logger = logging.getLogger(__name__)
 
 
-def build_consumer() -> Tuple[RabbitMQConsumer, RedisMetricsStore]:
-    """Construct the consumer graph using the application's environment config."""
+async def build_consumer() -> Tuple[RabbitMQConsumer, RedisMetricsStore]:
+    """Recover persisted window config, then construct the consumer graph."""
     settings = RabbitMQSettings.from_env()
     metrics_store = RedisMetricsStore()
+    try:
+        active_configuration = await metrics_store.read_active_configuration()
+        if active_configuration is None:
+            active_configuration = await metrics_store.initialize_active_configuration(
+                WindowConfiguration()
+            )
+    except Exception:
+        try:
+            await metrics_store.close()
+        except Exception:
+            logger.warning("Could not close Redis after consumer configuration recovery failed.")
+        raise
     processor = LibraryEventProcessor(
-        TumblingWindow(TUMBLING_WINDOW_SIZE),
-        SlidingWindow(SLIDING_WINDOW_SIZE),
+        TumblingWindow(active_configuration.tumbling_size),
+        SlidingWindow(
+            active_configuration.sliding_size,
+            active_configuration.sliding_interval,
+        ),
         metrics_store,
+        active_configuration,
     )
     return RabbitMQConsumer(processor, settings), metrics_store
 
 
 async def run_consumer() -> None:
     """Run until interrupted, then close Redis after the consumer stops."""
-    consumer, metrics_store = build_consumer()
+    consumer, metrics_store = await build_consumer()
     try:
         await consumer.run_forever()
     finally:

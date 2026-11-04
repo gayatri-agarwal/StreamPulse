@@ -1,14 +1,27 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
+import run_consumer
 from app.messaging.rabbitmq import RabbitMQConsumer, RabbitMQError, RabbitMQPublisher, RabbitMQSettings
+from app.main import create_app
 from app.processing.event_processor import LibraryEventProcessor
 from app.processing.metrics import Metrics
 from app.processing.window_manager import SlidingWindow, TumblingWindow
 from app.schemas import LibraryEvent
-from app.storage.redis_metrics import RedisMetricsStore, RedisStorageError
+from app.storage.redis_metrics import (
+    ConsumerMonitoringSnapshot,
+    MONITORING_HEARTBEAT_TTL_SECONDS,
+    RedisConfigurationDataError,
+    RedisConfigurationError,
+    RedisMetricsStore,
+    RedisMonitoringError,
+    RedisStorageError,
+)
+from app.processing.window_config import WindowConfiguration
 
 
 def make_event(value=1, event_id="event-1"):
@@ -34,20 +47,33 @@ class FakeExchange:
 
 
 class FakeChannel:
-    def __init__(self, exchange=None):
+    def __init__(self, exchange=None, queue=None):
         self.default_exchange = exchange or FakeExchange()
         self.declared = []
         self.qos = []
+        self.queue = queue or FakeQueue()
 
     async def declare_queue(self, name, **kwargs):
         self.declared.append((name, kwargs))
-        return FakeQueue()
+        return self.queue
 
     async def set_qos(self, **kwargs):
         self.qos.append(kwargs)
 
 
 class FakeQueue:
+    def __init__(self, *, message_count=4, consumer_count=1, declare_fail=False):
+        self.message_count = message_count
+        self.consumer_count = consumer_count
+        self.declare_fail = declare_fail
+        self.declare_calls = 0
+
+    async def declare(self):
+        self.declare_calls += 1
+        if self.declare_fail:
+            raise RuntimeError("fake queue inspection failure")
+        return self
+
     async def consume(self, callback):
         self.callback = callback
         return "fake-tag"
@@ -86,6 +112,44 @@ async def test_publisher_sends_valid_event_to_configured_queue():
     assert channel.declared == [(
         "events", {"durable": True, "arguments": {"x-single-active-consumer": True}}
     )]
+
+
+@pytest.mark.asyncio
+async def test_publisher_inspects_queue_counts_using_existing_connection():
+    queue = FakeQueue(message_count=7, consumer_count=2)
+    channel = FakeChannel(queue=queue)
+    connection = FakeConnection(channel)
+    connect_calls = []
+
+    async def connect(url):
+        connect_calls.append(url)
+        return connection
+
+    publisher = RabbitMQPublisher(RabbitMQSettings("amqps://fake-host", "events"), connect=connect)
+    await publisher.publish(make_event())
+    counts = await publisher.inspect_queue()
+
+    assert counts == {"messages_ready": 7, "consumer_count": 2}
+    assert queue.declare_calls == 1
+    assert len(connect_calls) == 1
+    assert connection.closed is False
+
+
+@pytest.mark.asyncio
+async def test_publisher_queue_inspection_failure_is_sanitized():
+    queue = FakeQueue(declare_fail=True)
+    channel = FakeChannel(queue=queue)
+
+    async def connect(url):
+        return FakeConnection(channel)
+
+    publisher = RabbitMQPublisher(RabbitMQSettings("amqps://user:secret@host", "events"), connect=connect)
+    await publisher.publish(make_event())
+
+    with pytest.raises(RabbitMQError) as error:
+        await publisher.inspect_queue()
+    assert str(error.value) == "Could not inspect RabbitMQ queue"
+    assert "secret" not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -142,6 +206,8 @@ async def test_consumer_validates_and_processes_before_acknowledging():
     assert processor.events[0].event_type.value == "BOOK_RETURNED"
     assert processor.events[0].value is not None
     assert processor.events[0].value != 7.5
+    assert consumer.processed_since_start == 1
+    assert consumer.processing_failures_since_start == 0
 
 
 @pytest.mark.asyncio
@@ -231,25 +297,137 @@ async def test_consumer_rejects_processing_failure_without_ack_or_requeue():
     await consumer.handle_message(message)
     assert message.acks == 0
     assert message.rejects == [False]
+    assert consumer.processed_since_start == 0
+    assert consumer.processing_failures_since_start == 1
 
 
 class FakeRedis:
     def __init__(self, fail=False):
         self.data = {}
+        self.expirations = {}
         self.fail = fail
+        self.pipeline_batches = []
 
-    async def set(self, key, value):
+    async def set(self, key, value, ex=None, nx=False):
         if self.fail:
             raise RuntimeError("redis transport error")
+        if nx and key in self.data:
+            return None
         self.data[key] = value
+        if ex is not None:
+            self.expirations[key] = ex
+        else:
+            self.expirations.pop(key, None)
+        return True
 
     async def get(self, key):
         if self.fail:
             raise RuntimeError("redis transport error")
         return self.data.get(key)
 
+    async def exists(self, key):
+        if self.fail:
+            raise RuntimeError("redis transport error")
+        return int(key in self.data)
+
+    async def delete(self, key):
+        if self.fail:
+            raise RuntimeError("redis transport error")
+        existed = key in self.data
+        self.data.pop(key, None)
+        self.expirations.pop(key, None)
+        return int(existed)
+
+    def pipeline(self, transaction=True):
+        return FakeRedisPipeline(self, transaction)
+
+    def expire_now(self, key):
+        self.data.pop(key, None)
+        self.expirations.pop(key, None)
+
     async def aclose(self):
         pass
+
+
+class FakeRedisPipeline:
+    def __init__(self, client, transaction):
+        self.client = client
+        self.transaction = transaction
+        self.commands = []
+        self.watched_key = None
+        self.watched_value = None
+        self.in_multi = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def watch(self, key):
+        if self.client.fail:
+            raise RuntimeError("redis transport error")
+        self.watched_key = key
+        self.watched_value = self.client.data.get(key)
+
+    async def get(self, key):
+        return await self.client.get(key)
+
+    async def unwatch(self):
+        self.watched_key = None
+
+    def multi(self):
+        self.in_multi = True
+
+    def set(self, key, value, ex=None):
+        self.commands.append(("set", key, value, ex))
+        return self
+
+    def delete(self, key):
+        self.commands.append(("delete", key))
+        return self
+
+    async def execute(self):
+        if self.client.fail:
+            raise RuntimeError("redis transport error")
+        assert self.transaction is True
+        if self.watched_key is not None and self.client.data.get(self.watched_key) != self.watched_value:
+            from redis.exceptions import WatchError
+            raise WatchError()
+        batch = list(self.commands)
+        self.client.pipeline_batches.append(batch)
+        for command in batch:
+            if command[0] == "set":
+                _, key, value, expiry = command
+                self.client.data[key] = value
+                if expiry is not None:
+                    self.client.expirations[key] = expiry
+                else:
+                    self.client.expirations.pop(key, None)
+            else:
+                _, key = command
+                self.client.data.pop(key, None)
+                self.client.expirations.pop(key, None)
+
+
+def make_monitoring_snapshot(**overrides):
+    values = {
+        "consumer_state": "running",
+        "consumer_instance_id": "consumer-test-1",
+        "last_heartbeat_at": "2026-11-04T12:00:00+00:00",
+        "processed_events_since_start": 12,
+        "processing_failures_since_start": 1,
+        "consumer_redis_status": "available",
+        "last_successful_aggregation_write_at": "2026-11-04T11:59:50+00:00",
+        "tumbling_window_size": 10,
+        "tumbling_window_progress": 2,
+        "sliding_window_size": 5,
+        "sliding_window_progress": 5,
+        "sliding_interval": "per_event",
+        "last_completed_tumbling_aggregation_at": None,
+    }
+    values.update(overrides)
+    return ConsumerMonitoringSnapshot(**values)
 
 
 @pytest.mark.asyncio
@@ -260,6 +438,250 @@ async def test_redis_metrics_store_round_trip_and_keys():
     assert await store.get_metrics("sliding") == metrics
     assert await store.get_metrics("tumbling") is None
     assert store.key_for("tumbling") == "streampulse:metrics:tumbling"
+    assert store.key_for("sliding") == "streampulse:metrics:sliding"
+
+
+@pytest.mark.asyncio
+async def test_active_configuration_initializes_with_defaults_only_when_missing():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+
+    initialized = await store.initialize_active_configuration()
+    assert initialized == WindowConfiguration()
+    assert await store.read_active_configuration() == WindowConfiguration()
+    assert client.expirations == {}
+
+
+@pytest.mark.asyncio
+async def test_active_configuration_initialization_does_not_overwrite_existing_value():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    existing = WindowConfiguration(tumbling_size=8, sliding_size=10, sliding_interval=3)
+    client.data[store.ACTIVE_CONFIGURATION_KEY] = store._serialize_configuration(existing)
+
+    assert await store.initialize_active_configuration() == existing
+    assert await store.read_active_configuration() == existing
+
+
+@pytest.mark.asyncio
+async def test_pending_configuration_round_trip_and_keys_are_separate():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    configuration = WindowConfiguration(tumbling_size=5, sliding_size=8, sliding_interval=7)
+
+    await store.save_pending_configuration(configuration)
+
+    assert await store.read_active_configuration() is None
+    assert await store.read_pending_configuration() == configuration
+    assert set(client.data) == {"streampulse:config:pending"}
+    assert client.expirations == {}
+
+
+@pytest.mark.asyncio
+async def test_pending_configuration_promotion_is_atomic_and_preserves_active_key():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    active = WindowConfiguration()
+    pending = WindowConfiguration(tumbling_size=8, sliding_size=10, sliding_interval=2)
+    await store.initialize_active_configuration(active)
+    await store.save_pending_configuration(pending)
+
+    promoted = await store.promote_pending_configuration()
+
+    assert promoted == pending
+    assert await store.read_active_configuration() == pending
+    assert await store.read_pending_configuration() is None
+    promotion_batch = client.pipeline_batches[-1]
+    assert [command[0] for command in promotion_batch] == ["set", "delete"]
+    assert promotion_batch[0][1] == store.ACTIVE_CONFIGURATION_KEY
+    assert promotion_batch[1][1] == store.PENDING_CONFIGURATION_KEY
+
+
+@pytest.mark.asyncio
+async def test_promoting_missing_pending_configuration_is_safe():
+    store = RedisMetricsStore(client=FakeRedis())
+    assert await store.promote_pending_configuration() is None
+
+
+@pytest.mark.asyncio
+async def test_clear_pending_configuration_reports_removed_state():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    await store.save_pending_configuration(WindowConfiguration())
+
+    assert await store.clear_pending_configuration() is True
+    assert await store.clear_pending_configuration() is False
+    assert await store.read_pending_configuration() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    "not-json",
+    "[]",
+    '{"tumbling_size":10,"sliding_size":5}',
+    '{"tumbling_size":7,"sliding_size":5,"sliding_interval":1}',
+    '{"tumbling_size":true,"sliding_size":5,"sliding_interval":1}',
+])
+async def test_invalid_stored_window_configuration_has_typed_data_error(payload):
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    client.data[store.ACTIVE_CONFIGURATION_KEY] = payload
+
+    with pytest.raises(RedisConfigurationDataError, match="Stored window configuration is invalid"):
+        await store.read_active_configuration()
+
+
+@pytest.mark.asyncio
+async def test_invalid_pending_configuration_is_not_promoted_over_active_value():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    active = WindowConfiguration()
+    await store.initialize_active_configuration(active)
+    client.data[store.PENDING_CONFIGURATION_KEY] = '{"tumbling_size":7}'
+
+    with pytest.raises(RedisConfigurationDataError):
+        await store.promote_pending_configuration()
+
+    assert await store.read_active_configuration() == active
+    assert store.PENDING_CONFIGURATION_KEY in client.data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "save", "initialize", "promote", "clear"])
+async def test_window_configuration_redis_failures_are_sanitized(operation):
+    store = RedisMetricsStore(client=FakeRedis(fail=True))
+    with pytest.raises(RedisConfigurationError) as error:
+        if operation == "read":
+            await store.read_active_configuration()
+        elif operation == "save":
+            await store.save_pending_configuration(WindowConfiguration())
+        elif operation == "initialize":
+            await store.initialize_active_configuration()
+        elif operation == "promote":
+            await store.promote_pending_configuration()
+        else:
+            await store.clear_pending_configuration()
+    assert "redis transport error" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_monitoring_snapshot_write_and_read_round_trip():
+    store = RedisMetricsStore(client=FakeRedis())
+    snapshot = make_monitoring_snapshot()
+
+    await store.write_monitoring_state(snapshot)
+
+    assert await store.read_monitoring_state() == snapshot
+
+
+@pytest.mark.asyncio
+async def test_monitoring_write_atomically_updates_snapshot_and_ttl_heartbeat():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+
+    await store.write_monitoring_state(make_monitoring_snapshot())
+
+    assert len(client.pipeline_batches) == 1
+    batch = client.pipeline_batches[0]
+    assert [command[0] for command in batch] == ["set", "set"]
+    assert batch[0][1] == store.MONITORING_STATE_KEY
+    assert batch[1][1] == store.MONITORING_HEARTBEAT_KEY
+    assert batch[1][3] == MONITORING_HEARTBEAT_TTL_SECONDS == 30
+    assert client.expirations[store.MONITORING_HEARTBEAT_KEY] == 30
+    assert store.MONITORING_STATE_KEY not in client.expirations
+
+
+@pytest.mark.asyncio
+async def test_monitoring_heartbeat_can_be_refreshed_with_30_second_ttl():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    await store.write_monitoring_state(make_monitoring_snapshot())
+
+    refreshed = await store.refresh_monitoring_heartbeat("2026-11-04T12:00:10Z")
+
+    assert refreshed is True
+    assert client.data[store.MONITORING_HEARTBEAT_KEY] == "2026-11-04T12:00:10Z"
+    assert client.expirations[store.MONITORING_HEARTBEAT_KEY] == 30
+    assert (await store.read_monitoring_state()).last_heartbeat_at == "2026-11-04T12:00:10Z"
+
+
+@pytest.mark.asyncio
+async def test_monitoring_heartbeat_refresh_does_not_create_missing_state():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+
+    refreshed = await store.refresh_monitoring_heartbeat("2026-11-04T12:00:10Z")
+
+    assert refreshed is False
+    assert client.data == {}
+
+
+@pytest.mark.asyncio
+async def test_missing_monitoring_state_is_not_treated_as_stale_consumer():
+    store = RedisMetricsStore(client=FakeRedis())
+
+    assert await store.read_monitoring_state() is None
+    assert await store.is_monitoring_heartbeat_fresh() is None
+
+
+@pytest.mark.asyncio
+async def test_expired_monitoring_heartbeat_with_snapshot_is_stale():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    snapshot = make_monitoring_snapshot()
+    await store.write_monitoring_state(snapshot)
+    client.expire_now(store.MONITORING_HEARTBEAT_KEY)
+
+    assert await store.read_monitoring_state() == snapshot
+    assert await store.is_monitoring_heartbeat_fresh() is False
+
+
+@pytest.mark.asyncio
+async def test_monitoring_write_failure_is_distinct_and_does_not_leak_transport_details():
+    client = FakeRedis(fail=True)
+    store = RedisMetricsStore(client=client)
+
+    with pytest.raises(RedisMonitoringError) as error:
+        await store.write_monitoring_state(make_monitoring_snapshot())
+
+    assert isinstance(error.value, RedisStorageError)
+    assert "redis transport error" not in str(error.value)
+    assert client.data == {}
+
+
+@pytest.mark.asyncio
+async def test_graceful_shutdown_persists_stopped_state_and_removes_heartbeat_atomically():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    await store.write_monitoring_state(make_monitoring_snapshot())
+    stopped = make_monitoring_snapshot(consumer_state="stopped")
+
+    await store.record_consumer_shutdown(stopped)
+
+    assert await store.read_monitoring_state() == stopped
+    assert await store.is_monitoring_heartbeat_fresh() is False
+    assert [command[0] for command in client.pipeline_batches[-1]] == ["set", "delete"]
+
+
+@pytest.mark.asyncio
+async def test_monitoring_keys_do_not_change_aggregation_summary_keys_or_values():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    tumbling = Metrics(10, 18.0, 1.8, 1.0, 3.0)
+    sliding = Metrics(5, 9.0, 1.8, 1.0, 3.0)
+    await store.save_metrics("tumbling", tumbling)
+    await store.save_metrics("sliding", sliding)
+
+    await store.write_monitoring_state(make_monitoring_snapshot())
+
+    assert await store.get_metrics("tumbling") == tumbling
+    assert await store.get_metrics("sliding") == sliding
+    assert set(client.data) == {
+        "streampulse:metrics:tumbling",
+        "streampulse:metrics:sliding",
+        "streampulse:monitoring:consumer:state",
+        "streampulse:monitoring:consumer:heartbeat",
+    }
 
 
 @pytest.mark.asyncio
@@ -275,11 +697,221 @@ async def test_redis_errors_are_wrapped_safely(operation):
 
 
 class RecordingStore:
-    def __init__(self):
+    def __init__(self, *, fail_aggregation=False, fail_monitoring=False, fail_shutdown=False):
         self.saved = []
+        self.aggregation_write_status = None
+        self.last_successful_aggregation_write_at = None
+        self.fail_aggregation = fail_aggregation
+        self.fail_monitoring = fail_monitoring
+        self.fail_shutdown = fail_shutdown
+        self.monitoring_snapshots = []
+        self.shutdown_snapshots = []
+        self.monitoring_failures = 0
+        self.shutdown_failures = 0
 
     async def save_metrics(self, window_type, metrics):
+        if self.fail_aggregation:
+            self.aggregation_write_status = "unavailable"
+            raise RedisStorageError("Could not save metrics to Redis")
         self.saved.append((window_type, metrics))
+        self.aggregation_write_status = "available"
+        self.last_successful_aggregation_write_at = datetime.now(timezone.utc).isoformat()
+
+    async def write_monitoring_state(self, snapshot):
+        if self.fail_monitoring:
+            self.monitoring_failures += 1
+            raise RedisMonitoringError("Could not write consumer monitoring state")
+        self.monitoring_snapshots.append(snapshot)
+
+    async def record_consumer_shutdown(self, snapshot):
+        if self.fail_shutdown:
+            self.shutdown_failures += 1
+            raise RedisMonitoringError("Could not record consumer shutdown state")
+        self.shutdown_snapshots.append(snapshot)
+
+
+def make_consumer_event_body(event_id):
+    return json.dumps({
+        "event_id": event_id,
+        "event_type": "BOOK_ISSUED",
+        "student_id": "student-1",
+        "book_id": "book-1",
+        "timestamp": "2026-01-01T00:00:00Z",
+    }).encode()
+
+
+def make_monitoring_consumer(store, *, tumbling_size=10, sliding_size=5, queue=None):
+    processor = LibraryEventProcessor(
+        TumblingWindow(tumbling_size),
+        SlidingWindow(sliding_size),
+        store,
+    )
+    channel = FakeChannel()
+    if queue is not None:
+        channel.declare_queue = queue
+
+    async def connect(url):
+        return FakeConnection(channel)
+
+    consumer = RabbitMQConsumer(
+        processor,
+        RabbitMQSettings("amqp://fake", "events"),
+        connect=connect,
+    )
+    return consumer, channel
+
+
+@pytest.mark.asyncio
+async def test_consumer_heartbeat_starts_only_after_successful_queue_consumption():
+    store = RecordingStore()
+    consumer, _ = make_monitoring_consumer(store)
+    await consumer.start()
+
+    assert consumer._heartbeat_task is not None
+    await consumer.close()
+
+    class FailingQueue:
+        async def consume(self, callback):
+            raise RuntimeError("broker consume setup failed")
+
+    store = RecordingStore()
+    async def declare_failing_queue(name, **kwargs):
+        return FailingQueue()
+    failed_consumer, _ = make_monitoring_consumer(store, queue=declare_failing_queue)
+    with pytest.raises(RabbitMQError):
+        await failed_consumer.start()
+    assert failed_consumer._heartbeat_task is None
+    assert store.monitoring_snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_consumer_heartbeat_refreshes_at_configured_interval(monkeypatch):
+    import app.messaging.rabbitmq as rabbitmq_module
+    monkeypatch.setattr(rabbitmq_module, "CONSUMER_HEARTBEAT_INTERVAL_SECONDS", 0.02)
+    store = RecordingStore()
+    consumer, _ = make_monitoring_consumer(store)
+    await consumer.start()
+    await asyncio.sleep(0.055)
+    count_before_close = len(store.monitoring_snapshots)
+
+    await consumer.close()
+    await asyncio.sleep(0.03)
+
+    assert count_before_close >= 3
+    assert len(store.monitoring_snapshots) == count_before_close
+    assert all(snapshot.consumer_state == "running" for snapshot in store.monitoring_snapshots)
+    assert all(snapshot.last_heartbeat_at is not None for snapshot in store.monitoring_snapshots)
+
+
+@pytest.mark.asyncio
+async def test_consumer_starts_only_one_heartbeat_task(monkeypatch):
+    import app.messaging.rabbitmq as rabbitmq_module
+    monkeypatch.setattr(rabbitmq_module, "CONSUMER_HEARTBEAT_INTERVAL_SECONDS", 0.02)
+    store = RecordingStore()
+    consumer, _ = make_monitoring_consumer(store)
+    await consumer.start()
+    original_task = consumer._heartbeat_task
+    consumer._start_heartbeat()
+    await asyncio.sleep(0.005)
+
+    assert consumer._heartbeat_task is original_task
+    assert len(store.monitoring_snapshots) == 1
+    await consumer.close()
+
+
+@pytest.mark.asyncio
+async def test_consumer_monitoring_snapshot_captures_progress_and_completed_tumbling_time():
+    store = RecordingStore()
+    consumer, _ = make_monitoring_consumer(store, tumbling_size=2, sliding_size=3)
+
+    first = FakeMessage(make_consumer_event_body("e1"))
+    second = FakeMessage(make_consumer_event_body("e2"))
+    await consumer.handle_message(first)
+    snapshot = consumer._make_monitoring_snapshot("running")
+    assert snapshot.tumbling_window_size == 2
+    assert snapshot.tumbling_window_progress == 1
+    assert snapshot.sliding_window_size == 3
+    assert snapshot.sliding_window_progress == 1
+    assert snapshot.sliding_interval == "per_event"
+    assert snapshot.last_completed_tumbling_aggregation_at is None
+
+    await consumer.handle_message(second)
+    completed = consumer._make_monitoring_snapshot("running")
+    assert consumer.processed_since_start == 2
+    assert completed.tumbling_window_progress == 0
+    assert completed.sliding_window_progress == 2
+    assert datetime.fromisoformat(completed.last_completed_tumbling_aggregation_at).utcoffset() == timezone.utc.utcoffset(None)
+
+
+@pytest.mark.asyncio
+async def test_aggregation_write_failure_is_counted_as_processing_failure():
+    store = RecordingStore(fail_aggregation=True)
+    consumer, _ = make_monitoring_consumer(store)
+    message = FakeMessage(make_consumer_event_body("e1"))
+
+    await consumer.handle_message(message)
+
+    assert message.acks == 0
+    assert message.rejects == [False]
+    assert consumer.processed_since_start == 0
+    assert consumer.processing_failures_since_start == 1
+    assert store.aggregation_write_status == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_monitoring_redis_failure_does_not_interrupt_processing_or_change_ack_behavior(monkeypatch):
+    import app.messaging.rabbitmq as rabbitmq_module
+    monkeypatch.setattr(rabbitmq_module, "CONSUMER_HEARTBEAT_INTERVAL_SECONDS", 60)
+    store = RecordingStore(fail_monitoring=True)
+    consumer, _ = make_monitoring_consumer(store)
+    await consumer.start()
+    await asyncio.sleep(0)
+    message = FakeMessage(make_consumer_event_body("e1"))
+
+    await consumer.handle_message(message)
+    await consumer.close()
+
+    assert message.acks == 1
+    assert message.rejects == []
+    assert consumer.processed_since_start == 1
+    assert consumer.processing_failures_since_start == 0
+    assert consumer.monitoring_failures_since_start >= 1
+    assert len(store.saved) == 1
+
+
+@pytest.mark.asyncio
+async def test_graceful_consumer_shutdown_records_stopped_state(monkeypatch):
+    import app.messaging.rabbitmq as rabbitmq_module
+    monkeypatch.setattr(rabbitmq_module, "CONSUMER_HEARTBEAT_INTERVAL_SECONDS", 60)
+    store = RecordingStore()
+    consumer, _ = make_monitoring_consumer(store)
+    await consumer.start()
+    await asyncio.sleep(0)
+    connection = consumer._connection
+
+    await consumer.close()
+
+    assert consumer._heartbeat_task is None
+    assert len(store.shutdown_snapshots) == 1
+    assert store.shutdown_snapshots[0].consumer_state == "stopped"
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_monitoring_failure_does_not_prevent_resource_cleanup(monkeypatch):
+    import app.messaging.rabbitmq as rabbitmq_module
+    monkeypatch.setattr(rabbitmq_module, "CONSUMER_HEARTBEAT_INTERVAL_SECONDS", 60)
+    store = RecordingStore(fail_shutdown=True)
+    consumer, _ = make_monitoring_consumer(store)
+    await consumer.start()
+    await asyncio.sleep(0)
+    connection = consumer._connection
+
+    await consumer.close()
+
+    assert store.shutdown_failures == 1
+    assert consumer.monitoring_failures_since_start >= 1
+    assert connection.closed is True
 
 
 @pytest.mark.asyncio
@@ -329,3 +961,281 @@ async def test_ten_and_five_event_windows_aggregate_actual_values_and_retain_tum
 
     await processor.process(make_event(22, "e11"))
     assert await store.get_metrics("tumbling") == completed
+
+
+async def create_configured_processor(*, store=None, active=None, pending=None):
+    store = store or RedisMetricsStore(client=FakeRedis())
+    active = active or WindowConfiguration(5, 5, 1)
+    processor = LibraryEventProcessor(
+        TumblingWindow(active.tumbling_size),
+        SlidingWindow(active.sliding_size, active.sliding_interval),
+        store,
+        active,
+    )
+    await store.initialize_active_configuration(active)
+    if pending is not None:
+        await store.save_pending_configuration(pending)
+    return processor, store
+
+
+@pytest.mark.asyncio
+async def test_pending_configuration_waits_for_old_tumbling_boundary_and_activates_after_persistence():
+    old = WindowConfiguration(5, 5, 1)
+    pending = WindowConfiguration(8, 10, 2)
+    processor, store = await create_configured_processor(active=old, pending=pending)
+    old_tumbling = processor.tumbling
+    old_sliding = processor.sliding
+
+    for index in range(1, 5):
+        result = await processor.process(make_event(index, f"old-{index}"))
+        assert "tumbling" not in result
+        assert processor.tumbling is old_tumbling
+        assert processor.sliding is old_sliding
+        assert await store.read_active_configuration() == old
+        assert await store.read_pending_configuration() == pending
+
+    completed = await processor.process(make_event(5, "old-5"))
+
+    assert completed["tumbling"].count == 5
+    assert await store.get_metrics("tumbling") == completed["tumbling"]
+    assert await store.read_active_configuration() == pending
+    assert await store.read_pending_configuration() is None
+    assert processor.active_configuration == pending
+    assert processor.tumbling.size == 8
+    assert processor.tumbling.pending_count == 0
+    assert processor.sliding.size == 10
+    assert processor.sliding.interval == 2
+    assert processor.sliding.event_count == 0
+    consumer = RabbitMQConsumer(processor, RabbitMQSettings("amqp://fake", "events"))
+    snapshot = consumer._make_monitoring_snapshot("running")
+    assert snapshot.tumbling_window_size == 8
+    assert snapshot.sliding_window_size == 10
+    assert snapshot.sliding_interval == 2
+
+
+@pytest.mark.asyncio
+async def test_first_events_after_activation_use_new_sizes_and_sliding_interval():
+    old = WindowConfiguration(5, 5, 1)
+    pending = WindowConfiguration(8, 10, 2)
+    processor, store = await create_configured_processor(active=old, pending=pending)
+
+    for index in range(5):
+        await processor.process(make_event(index, f"old-{index}"))
+
+    first = await processor.process(make_event(10, "new-1"))
+    assert first == {}
+    assert processor.tumbling.pending_count == 1
+    assert processor.sliding.event_count == 1
+    assert processor.sliding.interval == 2
+    assert (await store.get_metrics("sliding")).count == 5
+
+    second = await processor.process(make_event(11, "new-2"))
+    assert second["sliding"].count == 2
+    assert processor.tumbling.pending_count == 2
+    assert processor.sliding.event_count == 2
+
+
+@pytest.mark.asyncio
+async def test_no_pending_configuration_preserves_existing_window_instances_and_results():
+    processor, _ = await create_configured_processor(active=WindowConfiguration(5, 5, 1))
+    tumbling = processor.tumbling
+    sliding = processor.sliding
+
+    for index in range(5):
+        await processor.process(make_event(index, f"event-{index}"))
+
+    assert processor.tumbling is tumbling
+    assert processor.sliding is sliding
+    assert processor.tumbling.pending_count == 0
+    assert processor.sliding.event_count == 5
+
+
+@pytest.mark.asyncio
+async def test_promotion_failure_keeps_windows_usable_and_message_is_acknowledged():
+    class PromotionFailureStore(RedisMetricsStore):
+        async def promote_pending_configuration(self):
+            raise RedisConfigurationError("configuration store unavailable")
+
+    old = WindowConfiguration(5, 5, 1)
+    pending = WindowConfiguration(8, 10, 2)
+    processor, store = await create_configured_processor(
+        store=PromotionFailureStore(client=FakeRedis()), active=old, pending=pending
+    )
+    consumer = RabbitMQConsumer(processor, RabbitMQSettings("amqp://fake", "events"))
+    tumbling = processor.tumbling
+    sliding = processor.sliding
+
+    for index in range(4):
+        await consumer.handle_message(FakeMessage(make_consumer_event_body(f"event-{index}")))
+    boundary_message = FakeMessage(make_consumer_event_body("event-boundary"))
+    await consumer.handle_message(boundary_message)
+
+    assert boundary_message.acks == 1
+    assert boundary_message.rejects == []
+    assert processor.tumbling is tumbling
+    assert processor.sliding is sliding
+    assert processor.active_configuration == old
+    assert await store.read_active_configuration() == old
+    assert await store.read_pending_configuration() == pending
+
+
+@pytest.mark.asyncio
+async def test_aggregation_persistence_failure_prevents_configuration_activation():
+    class TumblingWriteFailureStore(RedisMetricsStore):
+        async def save_metrics(self, window_type, metrics):
+            if window_type == "tumbling":
+                raise RedisStorageError("Could not save metrics to Redis")
+            await super().save_metrics(window_type, metrics)
+
+        async def promote_pending_configuration(self):
+            raise AssertionError("pending config must not be promoted after storage failure")
+
+    old = WindowConfiguration(5, 5, 1)
+    pending = WindowConfiguration(8, 10, 2)
+    processor, store = await create_configured_processor(
+        store=TumblingWriteFailureStore(client=FakeRedis()), active=old, pending=pending
+    )
+    consumer = RabbitMQConsumer(processor, RabbitMQSettings("amqp://fake", "events"))
+
+    for index in range(4):
+        await consumer.handle_message(FakeMessage(make_consumer_event_body(f"event-{index}")))
+    boundary_message = FakeMessage(make_consumer_event_body("event-boundary"))
+    await consumer.handle_message(boundary_message)
+
+    assert boundary_message.acks == 0
+    assert boundary_message.rejects == [False]
+    assert processor.active_configuration == old
+    assert processor.tumbling.size == 5
+    assert processor.sliding.size == 5
+    assert await store.read_active_configuration() == old
+    assert await store.read_pending_configuration() == pending
+
+
+@pytest.mark.asyncio
+async def test_api_redis_consumer_boundary_and_monitoring_lifecycle_end_to_end(monkeypatch):
+    redis_client = FakeRedis()
+    store = RedisMetricsStore(client=redis_client)
+    channel = FakeChannel()
+
+    async def connect(url):
+        return FakeConnection(channel)
+
+    import app.messaging.rabbitmq as rabbitmq_module
+    monkeypatch.setattr(rabbitmq_module.aio_pika, "connect_robust", connect)
+    monkeypatch.setattr(run_consumer, "RedisMetricsStore", lambda: store)
+    monkeypatch.setenv("RABBITMQ_URL", "amqp://integration-test")
+    monkeypatch.setenv("RABBITMQ_QUEUE", "integration-events")
+
+    consumer, built_store = await run_consumer.build_consumer()
+    assert built_store is store
+    assert consumer.processor.active_configuration == WindowConfiguration()
+    assert await store.read_active_configuration() == WindowConfiguration()
+    await consumer.start()
+    await consumer._write_monitoring_snapshot()
+
+    class PassivePublisher:
+        settings = RabbitMQSettings("amqp://fake", "integration-events")
+
+        async def inspect_queue(self):
+            return None
+
+    first = {"tumbling_size": 5, "sliding_size": 8, "sliding_interval": 2}
+    latest = {"tumbling_size": 8, "sliding_size": 10, "sliding_interval": 3}
+    try:
+        with TestClient(create_app(publisher=PassivePublisher(), metrics_store=store)) as client:
+            first_put = client.put("/api/config", json=first)
+            latest_put = client.put("/api/config", json=latest)
+            before_boundary = client.get("/api/config")
+            assert first_put.status_code == latest_put.status_code == 200
+            assert before_boundary.json() == {
+                "active": {"tumbling_size": 10, "sliding_size": 5, "sliding_interval": 1},
+                "pending": latest,
+                "status": "pending",
+            }
+
+            restarted, _ = await run_consumer.build_consumer()
+            assert restarted.processor.active_configuration == WindowConfiguration()
+            assert await store.read_pending_configuration() == WindowConfiguration(**latest)
+
+            for index in range(9):
+                message = FakeMessage(make_consumer_event_body(f"integration-{index}"))
+                await channel.queue.callback(message)
+                assert message.acks == 1
+                assert message.rejects == []
+            assert consumer.processor.tumbling.size == 10
+            assert consumer.processor.tumbling.pending_count == 9
+            assert await store.read_active_configuration() == WindowConfiguration()
+
+            old_boundary_message = FakeMessage(make_consumer_event_body("integration-boundary"))
+            await channel.queue.callback(old_boundary_message)
+            assert old_boundary_message.acks == 1
+            assert old_boundary_message.rejects == []
+            assert (await store.get_metrics("tumbling")).count == 10
+            assert await store.read_active_configuration() == WindowConfiguration(**latest)
+            assert await store.read_pending_configuration() is None
+            assert consumer.processor.tumbling.size == 8
+            assert consumer.processor.sliding.size == 10
+            assert consumer.processor.sliding.interval == 3
+            assert consumer.processor.tumbling.pending_count == 0
+            assert consumer.processor.sliding.event_count == 0
+
+            for index in range(1, 3):
+                next_message = FakeMessage(make_consumer_event_body(f"integration-next-{index}"))
+                await channel.queue.callback(next_message)
+                assert next_message.acks == 1
+                assert consumer.processor.tumbling.pending_count == index
+                assert consumer.processor.sliding.event_count == index
+                assert (await store.get_metrics("sliding")).count == 5
+
+            interval_message = FakeMessage(make_consumer_event_body("integration-next-3"))
+            await channel.queue.callback(interval_message)
+            assert interval_message.acks == 1
+            assert consumer.processor.tumbling.pending_count == 3
+            assert consumer.processor.sliding.event_count == 3
+            assert (await store.get_metrics("sliding")).count == 3
+            last_completed_at = consumer._last_completed_tumbling_at
+            assert last_completed_at is not None
+
+            await consumer._write_monitoring_snapshot()
+            monitoring = client.get("/api/monitoring").json()
+            assert monitoring["consumer"]["status"] == "running"
+            assert monitoring["consumer"]["windows"] == {
+                "tumbling": {
+                    "size": 8, "progress": 3, "last_completed_at": last_completed_at,
+                },
+                "sliding": {"size": 10, "progress": 3, "interval": 3},
+            }
+            assert client.get("/api/config").json() == {
+                "active": latest,
+                "pending": None,
+                "status": "active",
+            }
+
+            await consumer.close()
+            stopped_monitoring = client.get("/api/monitoring").json()
+            assert stopped_monitoring["consumer"]["status"] == "stopped"
+            assert stopped_monitoring["consumer"]["windows"]["tumbling"]["size"] == 8
+            assert stopped_monitoring["consumer"]["windows"]["sliding"]["size"] == 10
+    finally:
+        if consumer._connection is not None:
+            await consumer.close()
+
+
+@pytest.mark.asyncio
+async def test_consumer_startup_recovers_custom_active_config_without_applying_pending(monkeypatch):
+    store = RedisMetricsStore(client=FakeRedis())
+    active = WindowConfiguration(8, 10, 3)
+    pending = WindowConfiguration(5, 8, 2)
+    await store.initialize_active_configuration(active)
+    await store.save_pending_configuration(pending)
+    monkeypatch.setattr(run_consumer, "RedisMetricsStore", lambda: store)
+    monkeypatch.setenv("RABBITMQ_URL", "amqp://integration-test")
+
+    consumer, _ = await run_consumer.build_consumer()
+
+    assert consumer.processor.active_configuration == active
+    assert consumer.processor.tumbling.size == 8
+    assert consumer.processor.sliding.size == 10
+    assert consumer.processor.sliding.interval == 3
+    assert await store.read_active_configuration() == active
+    assert await store.read_pending_configuration() == pending

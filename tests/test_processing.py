@@ -94,6 +94,23 @@ def test_sliding_window_reports_partial_results_then_rolls_over():
     assert window.event_count == 3
 
 
+def test_sliding_window_honors_event_interval_and_keeps_buffering_between_updates():
+    window = SlidingWindow(5, interval=2)
+
+    assert window.add(make_event(2, "e1")) is None
+    assert window.event_count == 1
+    assert window.add(make_event(4, "e2")) == Metrics(2, 6.0, 3.0, 2.0, 4.0)
+    assert window.add(make_event(6, "e3")) is None
+    assert window.event_count == 3
+    assert window.add(make_event(8, "e4")) == Metrics(4, 20.0, 5.0, 2.0, 8.0)
+
+
+@pytest.mark.parametrize("interval", [0, -1, 1.5, True, 5])
+def test_sliding_window_rejects_invalid_intervals(interval):
+    with pytest.raises(ValueError):
+        SlidingWindow(5, interval=interval)
+
+
 @pytest.mark.parametrize("window_class", [TumblingWindow, SlidingWindow])
 @pytest.mark.parametrize("size", [0, -1, 1.5, True])
 def test_windows_reject_invalid_sizes(window_class, size):

@@ -2,16 +2,27 @@
 
 import asyncio
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
+from uuid import uuid4
 
 import aio_pika
 
 from app.processing.event_processor import LibraryEventProcessor
 from app.schemas import LibraryEvent
+from app.storage.redis_metrics import (
+    ConsumerMonitoringSnapshot,
+)
+
+
+logger = logging.getLogger(__name__)
+CONSUMER_HEARTBEAT_INTERVAL_SECONDS = 10
+MONITORING_STORAGE_OPERATION_TIMEOUT_SECONDS = 2
 
 
 class RabbitMQError(RuntimeError):
@@ -55,6 +66,20 @@ class RabbitMQPublisher:
         self._connection: Any = None
         self._channel: Any = None
         self._exchange: Any = None
+        self._queue: Any = None
+
+    async def inspect_queue(self) -> Optional[dict]:
+        """Refresh queue-declare counts on the existing publisher channel, if established."""
+        if self._queue is None or self._channel is None:
+            return None
+        try:
+            declaration = await self._queue.declare()
+        except Exception:
+            raise RabbitMQError("Could not inspect RabbitMQ queue") from None
+        return {
+            "messages_ready": getattr(declaration, "message_count", None),
+            "consumer_count": getattr(declaration, "consumer_count", None),
+        }
 
     async def publish(self, event: LibraryEvent) -> None:
         if not isinstance(event, LibraryEvent):
@@ -63,7 +88,7 @@ class RabbitMQPublisher:
             if self._exchange is None:
                 self._connection = await self._connect(self.settings.url)
                 self._channel = await self._connection.channel()
-                await self._channel.declare_queue(
+                self._queue = await self._channel.declare_queue(
                     self.settings.queue,
                     durable=True,
                     arguments={"x-single-active-consumer": True},
@@ -79,6 +104,7 @@ class RabbitMQPublisher:
             connection, self._connection = self._connection, None
             self._channel = None
             self._exchange = None
+            self._queue = None
             if connection is not None:
                 try:
                     await connection.close()
@@ -93,7 +119,7 @@ class RabbitMQPublisher:
             except Exception:
                 raise RabbitMQError("Could not close RabbitMQ publisher connection") from None
             finally:
-                self._connection = self._channel = self._exchange = None
+                self._connection = self._channel = self._exchange = self._queue = None
 
 
 class RabbitMQConsumer:
@@ -107,6 +133,92 @@ class RabbitMQConsumer:
         self._connection: Any = None
         self._channel: Any = None
         self._consumer_tag: Any = None
+        self.processed_since_start = 0
+        self.processing_failures_since_start = 0
+        self.monitoring_failures_since_start = 0
+        self._consumer_instance_id = str(uuid4())
+        self._last_completed_tumbling_at: Optional[str] = None
+        self._monitoring_store = getattr(processor, "metrics_store", None)
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._monitoring_started = False
+
+    def _make_monitoring_snapshot(self, consumer_state: str) -> ConsumerMonitoringSnapshot:
+        processor = self.processor
+        tumbling = getattr(processor, "tumbling", None)
+        sliding = getattr(processor, "sliding", None)
+        store = self._monitoring_store
+        return ConsumerMonitoringSnapshot(
+            consumer_state=consumer_state,
+            consumer_instance_id=self._consumer_instance_id,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            processed_events_since_start=self.processed_since_start,
+            processing_failures_since_start=self.processing_failures_since_start,
+            consumer_redis_status=getattr(store, "aggregation_write_status", None),
+            last_successful_aggregation_write_at=getattr(
+                store, "last_successful_aggregation_write_at", None
+            ),
+            tumbling_window_size=getattr(tumbling, "size", None),
+            tumbling_window_progress=getattr(tumbling, "pending_count", None),
+            sliding_window_size=getattr(sliding, "size", None),
+            sliding_window_progress=getattr(sliding, "event_count", None),
+            sliding_interval=(
+                "per_event" if getattr(sliding, "interval", None) == 1
+                else getattr(sliding, "interval", None)
+            ),
+            last_completed_tumbling_aggregation_at=self._last_completed_tumbling_at,
+        )
+
+    def _start_heartbeat(self) -> None:
+        """Start at most one monitor loop after queue consumption is established."""
+        if not callable(getattr(self._monitoring_store, "write_monitoring_state", None)) or not callable(
+            getattr(self._monitoring_store, "record_consumer_shutdown", None)
+        ):
+            return
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            return
+        self._monitoring_started = True
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            started_at = loop.time()
+            await self._write_monitoring_snapshot()
+            elapsed = loop.time() - started_at
+            await asyncio.sleep(max(0, CONSUMER_HEARTBEAT_INTERVAL_SECONDS - elapsed))
+
+    async def _write_monitoring_snapshot(self) -> None:
+        try:
+            await asyncio.wait_for(
+                self._monitoring_store.write_monitoring_state(self._make_monitoring_snapshot("running")),
+                timeout=MONITORING_STORAGE_OPERATION_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            self.monitoring_failures_since_start += 1
+            logger.warning("Consumer monitoring snapshot write failed; event processing continues.")
+
+    async def _stop_heartbeat_and_record_shutdown(self) -> None:
+        task = self._heartbeat_task
+        self._heartbeat_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if not self._monitoring_started:
+            return
+        self._monitoring_started = False
+        try:
+            await asyncio.wait_for(
+                self._monitoring_store.record_consumer_shutdown(
+                    self._make_monitoring_snapshot("stopped")
+                ),
+                timeout=MONITORING_STORAGE_OPERATION_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            self.monitoring_failures_since_start += 1
+            logger.warning("Could not record consumer shutdown state; continuing cleanup.")
 
     async def handle_message(self, message: Any) -> None:
         """Measure consumer-side decode latency, then ack after processing and storage."""
@@ -123,11 +235,15 @@ class RabbitMQConsumer:
         latency_ms = (time.perf_counter() - started_at) * 1000.0
         event = replace(event, value=latency_ms)
         try:
-            await self.processor.process(event)
+            processing_result = await self.processor.process(event)
         except Exception:
+            self.processing_failures_since_start += 1
             # A dead-letter exchange can retain failures; otherwise RabbitMQ discards them.
             await message.reject(requeue=False)
             return
+        self.processed_since_start += 1
+        if isinstance(processing_result, dict) and "tumbling" in processing_result:
+            self._last_completed_tumbling_at = datetime.now(timezone.utc).isoformat()
         await message.ack()
 
     async def start(self) -> None:
@@ -142,6 +258,7 @@ class RabbitMQConsumer:
                 arguments={"x-single-active-consumer": True},
             )
             self._consumer_tag = await queue.consume(self.handle_message)
+            self._start_heartbeat()
         except Exception:
             await self.close()
             raise RabbitMQError("Could not start RabbitMQ consumer") from None
@@ -155,6 +272,7 @@ class RabbitMQConsumer:
             await self.close()
 
     async def close(self) -> None:
+        await self._stop_heartbeat_and_record_shutdown()
         if self._connection is not None:
             try:
                 await self._connection.close()
