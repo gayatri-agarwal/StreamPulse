@@ -100,14 +100,14 @@ class FakeMetricsStore:
             raise RedisConfigurationError("Could not read window configuration")
 
 
-def make_consumer_snapshot(consumer_state="running"):
+def make_consumer_snapshot(consumer_state="running", consumer_redis_status="available"):
     return ConsumerMonitoringSnapshot(
         consumer_state=consumer_state,
         consumer_instance_id="consumer-test-1",
         last_heartbeat_at="2026-11-04T12:00:00+00:00",
         processed_events_since_start=9,
         processing_failures_since_start=2,
-        consumer_redis_status="available",
+        consumer_redis_status=consumer_redis_status,
         last_successful_aggregation_write_at="2026-11-04T11:59:50+00:00",
         tumbling_window_size=10,
         tumbling_window_progress=3,
@@ -561,6 +561,33 @@ def test_monitoring_endpoint_distinguishes_stale_and_gracefully_stopped_consumer
 
     assert response.status_code == 200
     assert response.json()["consumer"]["status"] == expected
+    assert response.json()["consumer"]["redis_status"] == "not_verified"
+
+
+def test_monitoring_endpoint_does_not_report_missing_consumer_redis_status_as_available():
+    store = FakeMetricsStore(
+        monitoring_snapshot=make_consumer_snapshot(consumer_redis_status=None),
+        heartbeat_fresh=True,
+    )
+    with TestClient(create_app(publisher=FakePublisher(), metrics_store=store)) as client:
+        response = client.get("/api/monitoring")
+
+    assert response.status_code == 200
+    assert response.json()["consumer"]["status"] == "running"
+    assert response.json()["consumer"]["redis_status"] == "not_verified"
+
+
+def test_monitoring_endpoint_reports_current_consumer_redis_write_failure():
+    store = FakeMetricsStore(
+        monitoring_snapshot=make_consumer_snapshot(consumer_redis_status="unavailable"),
+        heartbeat_fresh=True,
+    )
+    with TestClient(create_app(publisher=FakePublisher(), metrics_store=store)) as client:
+        response = client.get("/api/monitoring")
+
+    assert response.status_code == 200
+    assert response.json()["consumer"]["status"] == "running"
+    assert response.json()["consumer"]["redis_status"] == "unavailable"
 
 
 def test_monitoring_endpoint_does_not_infer_crash_when_monitoring_never_initialized():
@@ -572,6 +599,7 @@ def test_monitoring_endpoint_does_not_infer_crash_when_monitoring_never_initiali
     assert response.json()["consumer"]["status"] == "unavailable"
     assert response.json()["consumer"]["reason"] == "not_initialized"
     assert response.json()["consumer"]["last_heartbeat"] is None
+    assert response.json()["consumer"]["redis_status"] == "not_verified"
 
 
 def test_monitoring_endpoint_reports_redis_unavailable_without_returning_503():

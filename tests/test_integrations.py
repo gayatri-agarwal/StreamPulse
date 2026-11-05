@@ -859,6 +859,35 @@ async def test_aggregation_write_failure_is_counted_as_processing_failure():
 
 
 @pytest.mark.asyncio
+async def test_aggregation_write_status_refreshes_running_snapshot_and_recovers():
+    store = RecordingStore(fail_aggregation=True)
+    consumer, _ = make_monitoring_consumer(store, sliding_size=2)
+    await consumer.start()
+    await asyncio.sleep(0)
+
+    failed_message = FakeMessage(make_consumer_event_body("redis-write-failed"))
+    await consumer.handle_message(failed_message)
+    assert failed_message.rejects == [False]
+    for _ in range(10):
+        if store.monitoring_snapshots and store.monitoring_snapshots[-1].consumer_redis_status == "unavailable":
+            break
+        await asyncio.sleep(0)
+    assert store.monitoring_snapshots[-1].consumer_redis_status == "unavailable"
+
+    store.fail_aggregation = False
+    recovered_message = FakeMessage(make_consumer_event_body("redis-write-recovered"))
+    await consumer.handle_message(recovered_message)
+    assert recovered_message.acks == 1
+    for _ in range(10):
+        if store.monitoring_snapshots[-1].consumer_redis_status == "available":
+            break
+        await asyncio.sleep(0)
+    assert store.monitoring_snapshots[-1].consumer_redis_status == "available"
+    assert store.monitoring_snapshots[-1].last_successful_aggregation_write_at is not None
+    await consumer.close()
+
+
+@pytest.mark.asyncio
 async def test_monitoring_redis_failure_does_not_interrupt_processing_or_change_ack_behavior(monkeypatch):
     import app.messaging.rabbitmq as rabbitmq_module
     monkeypatch.setattr(rabbitmq_module, "CONSUMER_HEARTBEAT_INTERVAL_SECONDS", 60)

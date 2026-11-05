@@ -1,5 +1,7 @@
 """FastAPI application for publishing library events and reading metrics."""
+from dotenv import load_dotenv
 
+load_dotenv()
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -294,6 +296,14 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                 # Do not expose transport exception details or mutate existing health state.
                 rabbitmq_status = "unavailable"
 
+        consumer_redis_status = "not_verified"
+        if (
+            consumer_status == "running"
+            and snapshot is not None
+            and snapshot.consumer_redis_status in {"available", "unavailable"}
+        ):
+            consumer_redis_status = snapshot.consumer_redis_status
+
         return {
             "api": {
                 "status": "available",
@@ -314,7 +324,7 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                 "last_heartbeat": snapshot.last_heartbeat_at if snapshot is not None else None,
                 "processed_since_start": snapshot.processed_events_since_start if snapshot is not None else None,
                 "processing_failures_since_start": snapshot.processing_failures_since_start if snapshot is not None else None,
-                "redis_status": snapshot.consumer_redis_status if snapshot is not None else None,
+                "redis_status": consumer_redis_status,
                 "last_successful_aggregation_write": snapshot.last_successful_aggregation_write_at if snapshot is not None else None,
                 "windows": {
                     "tumbling": {

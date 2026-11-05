@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101b3d">
+  <meta name="theme-color" content="#202b40">
   <title>StreamPulse — Library Analytics</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=dashboard-polish-2">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css?v=architecture-status-1">
 </head>
 <body>
   <header class="topbar">
@@ -121,25 +121,27 @@
       </section>
     </section>
 
-    <section class="panel chart-panel" aria-labelledby="events-chart-title">
-      <div class="section-title-row chart-heading-row">
-        <div><p class="eyebrow">WINDOW COMPARISON</p><h2 id="events-chart-title">Events per Window</h2><p class="panel-copy">Event counts in the latest tumbling and sliding windows.</p></div>
-        <div class="chart-legend" aria-label="Chart legend"><span><i class="legend-dot tumbling-dot"></i>Tumbling</span><span><i class="legend-dot sliding-dot"></i>Sliding</span></div>
-      </div>
-      <div id="events-chart-message" class="chart-message">Waiting for API metrics&hellip;</div>
-      <div class="chart-wrap events-chart-wrap"><canvas id="events-chart" aria-label="Bar chart comparing event counts in tumbling and sliding windows" role="img"></canvas></div>
-      <p class="chart-footnote">Count is the number of events currently represented by each window.</p>
-    </section>
+    <div class="chart-grid">
+      <section class="panel chart-panel" aria-labelledby="events-chart-title">
+        <div class="section-title-row chart-heading-row">
+          <div><p class="eyebrow">WINDOW COMPARISON</p><h2 id="events-chart-title">Events per Window</h2><p class="panel-copy">Event counts in the latest tumbling and sliding windows.</p></div>
+          <div class="chart-legend" aria-label="Chart legend"><span><i class="legend-dot tumbling-dot"></i>Tumbling</span><span><i class="legend-dot sliding-dot"></i>Sliding</span></div>
+        </div>
+        <div id="events-chart-message" class="chart-message">Waiting for API metrics&hellip;</div>
+        <div class="chart-wrap events-chart-wrap"><canvas id="events-chart" aria-label="Bar chart comparing event counts in tumbling and sliding windows" role="img"></canvas></div>
+        <p class="chart-footnote">Count is the number of events currently represented by each window.</p>
+      </section>
 
-    <section class="panel chart-panel" aria-labelledby="latency-chart-title">
-      <div class="section-title-row chart-heading-row">
-        <div><p class="eyebrow">PROCESSING LATENCY</p><h2 id="latency-chart-title">Consumer Latency Comparison (ms)</h2><p class="panel-copy">Compare summed, average, minimum, and maximum consumer latency for each window.</p></div>
-        <div class="chart-legend" aria-label="Chart legend"><span><i class="legend-dot tumbling-dot"></i>Tumbling</span><span><i class="legend-dot sliding-dot"></i>Sliding</span></div>
-      </div>
-      <div id="latency-chart-message" class="chart-message">Waiting for API metrics&hellip;</div>
-      <div class="chart-wrap latency-chart-wrap"><canvas id="latency-chart" aria-label="Bar chart comparing latency sum, average, minimum, and maximum in milliseconds" role="img"></canvas></div>
-      <p class="chart-footnote">Values are shown in milliseconds with source precision preserved for small measurements.</p>
-    </section>
+      <section class="panel chart-panel" aria-labelledby="latency-chart-title">
+        <div class="section-title-row chart-heading-row">
+          <div><p class="eyebrow">PROCESSING LATENCY</p><h2 id="latency-chart-title">Consumer Latency Comparison (ms)</h2><p class="panel-copy">Compare summed, average, minimum, and maximum consumer latency for each window.</p></div>
+          <div class="chart-legend" aria-label="Chart legend"><span><i class="legend-dot tumbling-dot"></i>Tumbling</span><span><i class="legend-dot sliding-dot"></i>Sliding</span></div>
+        </div>
+        <div id="latency-chart-message" class="chart-message">Waiting for API metrics&hellip;</div>
+        <div class="chart-wrap latency-chart-wrap"><canvas id="latency-chart" aria-label="Bar chart comparing latency sum, average, minimum, and maximum in milliseconds" role="img"></canvas></div>
+        <p class="chart-footnote">Values are shown in milliseconds with source precision preserved for small measurements.</p>
+      </section>
+    </div>
     <section class="panel events-panel" aria-labelledby="events-title">
       <div class="section-title-row">
         <div class="panel-heading compact">
@@ -252,6 +254,6 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" crossorigin="anonymous"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=redis-reporting-1"></script>
 </body>
 </html>

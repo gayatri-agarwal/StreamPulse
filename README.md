@@ -228,11 +228,8 @@ automatically load `.env`. Run the following safe, reusable snippet in **each
 PowerShell terminal** that runs the backend or consumer:
 
 ```powershell
-Get-Content .env | ForEach-Object {
-    if ($_ -match '^\s*([^#=\s]+)\s*=\s*(.*)\s*$') {
-        Set-Item -Path "Env:$($matches[1])" -Value $matches[2].Trim()
-    }
-}
+docker ps
+docker exec -it streampulse-redis redis-cli ping
 ```
 
 Confirm that the required names are present without printing secret values:

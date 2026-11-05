@@ -3,6 +3,7 @@
 // Keep the backend origin in one place. Use the same API port as the README command.
 const API_BASE_URL = "http://127.0.0.1:8000";
 const REFRESH_INTERVAL_MS = 10_000;
+const CHART_FONT_FAMILY = getComputedStyle(document.documentElement).getPropertyValue("--font-body").trim();
 
 const apiStatus = document.getElementById("api-status");
 const rabbitStatus = document.getElementById("rabbit-status");
@@ -62,8 +63,8 @@ const architectureComponents = {
   generation: {
     name: "Library Event Generation",
     description: "Library actions enter the event flow here. The manual action form publishes individual events through the existing API.",
-    status: () => "Manual available",
-    state: () => "available",
+    status: generationStatusLabel,
+    state: generationStatusState,
     information: ["Manual Event Generation: available through the existing library actions form.", "On-demand Random Batch Producer: generates a finite sample batch through the same event publishing flow; it is an input method, not a separate processing service."],
   },
   rabbitmq: {
@@ -84,7 +85,7 @@ const architectureComponents = {
     name: "Streaming Window Manager",
     description: "The in-memory window managers summarize consumer events before the summaries are stored in Redis.",
     status: windowStatusLabel,
-    state: () => consumerStatusState(architectureMonitoringData?.consumer?.status),
+    state: windowStatusState,
     information: windowInformation,
   },
   redis: {
@@ -224,11 +225,23 @@ function consumerInformation() {
 function windowStatusLabel() {
   if (monitoringLoading()) return "Loading monitoring…";
   if (monitoringFailed()) return "Monitoring unavailable";
-  const status = architectureMonitoringData?.consumer?.status;
-  if (status === "running") return "Fresh snapshot";
+  const consumer = architectureMonitoringData?.consumer;
+  const status = consumer?.status;
+  if (status === "running" && consumer?.windows) return "Fresh snapshot";
   if (status === "stale") return "Stale snapshot";
   if (status === "stopped") return "Final stopped snapshot";
   return "Window data unavailable";
+}
+
+function windowStatusState() {
+  if (monitoringLoading()) return "checking";
+  if (monitoringFailed()) return "monitoring-unavailable";
+  const consumer = architectureMonitoringData?.consumer;
+  if (consumer?.status === "running" && consumer.windows) return "available";
+  if (consumer?.status === "stale") return "stale";
+  if (consumer?.status === "stopped") return "stopped";
+  if (consumer?.status === "unavailable") return "monitoring-unavailable";
+  return "not_verified";
 }
 
 function windowInformation() {
@@ -435,7 +448,10 @@ function redisStatusLabel() {
   const consumerQualifier = consumer?.status === "stale"
     ? " (stale snapshot)"
     : consumer?.status === "stopped" ? " (final snapshot)" : "";
-  return `API: ${architectureStatusLabel(apiStatus)} · Consumer${consumerQualifier}: ${architectureStatusLabel(consumerStatus)}`;
+  const currentConsumerStatus = consumer?.status === "running" && consumerStatus
+    ? consumerStatus
+    : "not_verified";
+  return `API: ${architectureStatusLabel(apiStatus)} · Consumer${consumerQualifier}: ${architectureStatusLabel(currentConsumerStatus)}`;
 }
 
 function redisStatusState() {
@@ -443,8 +459,10 @@ function redisStatusState() {
   if (monitoringFailed()) return "monitoring-unavailable";
   const apiStatus = architectureMonitoringData?.api?.redis_status;
   const consumerStatus = architectureMonitoringData?.consumer?.redis_status;
-  if (apiStatus === "unavailable" || consumerStatus === "unavailable") return "unavailable";
-  if (apiStatus === "available" && consumerStatus === "available") return "available";
+  const consumerState = architectureMonitoringData?.consumer?.status;
+  if (apiStatus === "unavailable") return "unavailable";
+  if (consumerState === "running" && consumerStatus === "unavailable") return "unavailable";
+  if (apiStatus === "available" && consumerState === "running" && consumerStatus === "available") return "available";
   return "not_verified";
 }
 
@@ -497,7 +515,7 @@ function renderArchitectureStatuses() {
         : windowStatusLabel();
   const redisStatus = redisStatusLabel();
   const labels = {
-    generation: "Manual + batch available",
+    generation: generationStatusLabel(),
     rabbitmq: rabbitmqStatus,
     consumer: consumerStatus,
     windows: windowsStatus,
@@ -506,10 +524,10 @@ function renderArchitectureStatuses() {
     dashboard: architectureState.dashboard === "connected" ? "Connected" : architectureState.dashboard === "disconnected" ? "Disconnected" : "Checking",
   };
   const states = {
-    generation: "available",
+    generation: generationStatusState(),
     rabbitmq: monitoringLoading() ? "checking" : monitoringFailed() ? "monitoring-unavailable" : architectureMonitoringData?.rabbitmq?.status || "not_verified",
     consumer: consumerStatusState(architectureMonitoringData?.consumer?.status),
-    windows: consumerStatusState(architectureMonitoringData?.consumer?.status),
+    windows: windowStatusState(),
     redis: redisStatusState(),
     api: architectureState.api === "connected" ? "available" : architectureState.api,
     dashboard: architectureState.dashboard,
@@ -522,6 +540,24 @@ function renderArchitectureStatuses() {
     }
   });
   renderArchitectureDetail();
+}
+
+function generationStatusState() {
+  if (architectureState.api === "disconnected" || ["unavailable", "not_configured"].includes(architectureState.rabbitmq)) {
+    return "unavailable";
+  }
+  if (architectureState.api !== "connected") return "checking";
+  if (architectureState.rabbitmq === "available") return "available";
+  return architectureState.rabbitmq === "checking" ? "checking" : "not_verified";
+}
+
+function generationStatusLabel() {
+  return ({
+    available: "Manual + batch available",
+    unavailable: "Event publishing unavailable",
+    checking: "Checking",
+    not_verified: "Event path not verified",
+  })[generationStatusState()];
 }
 
 architectureNodes.forEach((node) => node.addEventListener("click", () => {
@@ -556,17 +592,20 @@ function setApiStatus(available, label) {
 }
 
 function setServiceStatus(element, name, value) {
-  const known = ["available", "unavailable", "not_configured", "not_verified"];
-  const normalized = known.includes(value) ? value : "not_verified";
-  const readable = {
-    available: "Connected",
-    unavailable: "Unavailable",
-    not_configured: "Not configured",
-    not_verified: "Not verified",
-  }[normalized];
+  const states = {
+    available: { label: "Connected", className: "service-connected", color: "#22C55E", tint: "#22C55E12" },
+    unavailable: { label: "Disconnected", className: "service-unavailable", color: "#EF4444", tint: "#EF444412" },
+    not_configured: { label: "Not configured", className: "service-unavailable", color: "#EF4444", tint: "#EF444412" },
+    not_verified: { label: "Not verified", className: "service-unverified", color: "#F59E0B", tint: "#F59E0B12" },
+    connecting: { label: "Connecting", className: "service-unverified", color: "#F59E0B", tint: "#F59E0B12" },
+  };
+  const state = states[value] || states.not_verified;
   element.innerHTML = `${name} <b></b>`;
-  element.querySelector("b").textContent = readable;
-  element.classList.toggle("service-unavailable", normalized === "unavailable");
+  element.querySelector("b").textContent = state.label;
+  element.classList.remove("service-connected", "service-unavailable", "service-unverified");
+  element.classList.add(state.className);
+  element.style.setProperty("--service-status-color", state.color);
+  element.style.setProperty("--service-status-tint", state.tint);
 }
 
 async function getJson(path) {
@@ -739,14 +778,14 @@ function updateOneChart(existingChart, canvasId, messageElement, labels, metricN
     scales: {
       x: {
         grid: { display: false },
-        title: { display: true, text: "Window", color: "#738098", font: { family: "DM Sans", size: 12, weight: "600" } },
-        ticks: { color: "#59647c", maxRotation: 0, font: { family: "DM Sans", size: 11 } },
+        title: { display: true, text: "Window", color: "#586477", font: { family: CHART_FONT_FAMILY, size: 13, weight: "600" } },
+        ticks: { color: "#465166", maxRotation: 0, font: { family: CHART_FONT_FAMILY, size: 13 } },
       },
       y: {
         beginAtZero: true,
         grid: { color: "#edf0f5" },
-        title: { display: true, text: axisTitle, color: "#738098", font: { family: "DM Sans", size: 12, weight: "600" } },
-        ticks: { color: "#59647c", maxTicksLimit: 5, font: { family: "DM Sans", size: 10 }, callback: formatter },
+        title: { display: true, text: axisTitle, color: "#586477", font: { family: CHART_FONT_FAMILY, size: 13, weight: "600" } },
+        ticks: { color: "#465166", maxTicksLimit: 5, font: { family: CHART_FONT_FAMILY, size: 12 }, callback: formatter },
       },
     },
   };

@@ -140,6 +140,7 @@ class RabbitMQConsumer:
         self._last_completed_tumbling_at: Optional[str] = None
         self._monitoring_store = getattr(processor, "metrics_store", None)
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_refresh_requested = asyncio.Event()
         self._monitoring_started = False
 
     def _make_monitoring_snapshot(self, consumer_state: str) -> ConsumerMonitoringSnapshot:
@@ -185,7 +186,15 @@ class RabbitMQConsumer:
             started_at = loop.time()
             await self._write_monitoring_snapshot()
             elapsed = loop.time() - started_at
-            await asyncio.sleep(max(0, CONSUMER_HEARTBEAT_INTERVAL_SECONDS - elapsed))
+            try:
+                await asyncio.wait_for(
+                    self._heartbeat_refresh_requested.wait(),
+                    timeout=max(0, CONSUMER_HEARTBEAT_INTERVAL_SECONDS - elapsed),
+                )
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                self._heartbeat_refresh_requested.clear()
 
     async def _write_monitoring_snapshot(self) -> None:
         try:
@@ -238,10 +247,18 @@ class RabbitMQConsumer:
             processing_result = await self.processor.process(event)
         except Exception:
             self.processing_failures_since_start += 1
+            if getattr(self._monitoring_store, "aggregation_write_status", None) == "unavailable":
+                self._heartbeat_refresh_requested.set()
             # A dead-letter exchange can retain failures; otherwise RabbitMQ discards them.
             await message.reject(requeue=False)
             return
         self.processed_since_start += 1
+        if (
+            isinstance(processing_result, dict)
+            and processing_result
+            and getattr(self._monitoring_store, "aggregation_write_status", None) in {"available", "unavailable"}
+        ):
+            self._heartbeat_refresh_requested.set()
         if isinstance(processing_result, dict) and "tumbling" in processing_result:
             self._last_completed_tumbling_at = datetime.now(timezone.utc).isoformat()
         await message.ack()
