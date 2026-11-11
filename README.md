@@ -65,10 +65,32 @@ events, configuration, and metrics.
   status, and configuration controls.
 - Automated unit, API, integration, and consumer tests.
 
+### Experiment run stop requests
+
+The run `complete`, `fail`, and `cancel` endpoints persist a durable stop
+intent and close run-scoped event ingestion atomically. They return HTTP 202
+while the run's actual lifecycle status remains nonterminal. A running
+workload runner observes the intent at safe boundaries and stops generating
+or publishing further events; an event whose publish has already begun is
+allowed to settle and have its outcome recorded. Repeating the same stop
+request is idempotent, while requesting a conflicting terminal target is
+rejected. These endpoints request a drain; they do not themselves drain the
+consumer. A background finalizer attempts the requested terminal transition
+after the workload runner releases its claim, and only after accepted events
+have settled; repeating the stop request allows another attempt when pending
+work previously blocked finalization.
+
 The project does **not** currently implement authentication, durable window
 checkpoints, a dead-letter exchange configuration, exactly-once processing, or
 time-based windows. Those are possible future improvements, not current
 features.
+
+The RabbitMQ consumer drains active delivery handlers before closing its
+channel. `RABBITMQ_CONSUMER_DRAIN_TIMEOUT_SECONDS` controls the bounded wait
+(default 30 seconds). If the timeout expires, the consumer closes the channel
+and cancels remaining handler tasks so unacknowledged deliveries can be
+redelivered. Such a drain is reported as incomplete; it does not imply that
+processing or aggregation was exactly once.
 
 ## Technology stack
 
@@ -609,6 +631,86 @@ and the metrics endpoint responds:
 Invoke-RestMethod http://127.0.0.1:8000/api/metrics
 ```
 
+## Measurement foundation
+
+Events may include an optional UUID `run_id`. The API preserves it in the event
+message and consumer processing path. Events without a `run_id` remain ordinary
+dashboard traffic. `GET /api/measurements` returns system-wide measurements;
+`GET /api/measurements?run_id=<uuid>` returns measurements isolated to one run.
+The existing `GET /api/monitoring` response also includes a `measurements`
+object when Redis measurement data is available. A future experiment runner
+can supply one shared `run_id` for all events it publishes; this phase does not
+create or manage runs.
+
+Measurement names and boundaries:
+
+- `publish_latency_ms`: monotonic API duration of one RabbitMQ publish attempt,
+  including a failed attempt when the broker call raises.
+- `decode_validation_latency_ms`: consumer JSON decoding and event validation.
+  This remains the numeric value used by the existing window summaries for
+  backward compatibility; it is not full processing latency.
+- `consumer_processing_latency_ms`: monotonic consumer callback duration from
+  delivery through decoding, window processing, and required summary writes.
+- `redis_persistence_latency_ms`: monotonic duration of the Redis summary
+  writes triggered by that event. It is null for events that cause no summary
+  write.
+- `publish_to_delivery_latency_ms`: API event timestamp to consumer delivery.
+  This includes publish duration and broker/network wait; it is not pure queue
+  wait. A pure queue-wait value cannot be measured from the current message
+  protocol because the publisher completion time is not carried to the
+  consumer.
+- `end_to_end_latency_ms`: API event timestamp to successful completion of
+  consumer processing and required summary persistence.
+
+Durations within one process use a monotonic high-resolution clock. The last
+two cross-process measurements use UTC timestamps and can be affected by clock
+skew between API and consumer hosts. Negative timestamp differences are
+reported as missing rather than clamped to zero.
+
+Consumer `consumer_successes` counts successful delivery attempts;
+`consumer_unique_successes` counts an `event_id` once in the overall scope and
+once in each applicable run scope. Successful consumer latency samples and
+completion timestamps are stored only for the first observed success per
+scope. Failed processing samples remain per attempt. Redis WATCH/MULTI/EXEC
+protects the deduplication decision and unique-success updates as one
+transaction. Deduplication keys expire after seven days, so this guarantee
+covers redeliveries within that retention period; it does not make window
+aggregation exactly-once.
+
+The measurement summary contains separate publish and consumer attempt,
+success, and failure counts and rates. Publish failure rate is
+`publish_failures / publish_attempts`; consumer failure rate is
+`consumer_failures / consumer_attempts`. They are not combined, since they
+represent different stages and denominators. A zero-attempt rate is null.
+Latency averages use the actual retained samples for that stage. P95 uses the
+nearest-rank method (`ceil(0.95 * sample_count)`) over those samples, not an
+estimate from summary statistics. Empty sample sets return null.
+
+`inter_arrival_rate_events_per_second` is the inverse mean interval between
+retained unique success-completion timestamps:
+`(sample_count - 1) / (last_timestamp - first_timestamp)`. It is null with
+fewer than two timestamps or a zero-length span. The legacy
+`throughput_events_per_second` field remains as an alias for compatibility; it
+is not a run-duration benchmark throughput value. Timestamps come from the
+consumer wall clock; monotonic clocks cannot be compared across process
+restarts. The rate describes at most the latest 10,000 timestamps and is
+sensitive to wall-clock changes.
+
+Redis keys use `streampulse:measurements:overall:*` for all traffic and
+`streampulse:measurements:run:<uuid>:*` for an individual run. Run measurements
+are also included in the system-wide summary, but ordinary events without a
+`run_id` never enter a run-specific key. Per-stage latency lists and successful
+completion timestamp lists are capped at 10,000 newest entries. Deduplication
+uses a hashed event ID key in each scope with a seven-day TTL. Measurement
+keys expire after seven days without updates; a touched key's expiry is
+refreshed on update. Counters and samples are best-effort telemetry: Redis
+measurement-write errors do not change broker publish outcomes or consumer
+acknowledgement behavior, and each write is bounded by a two-second timeout.
+This is temporary monitoring storage, not durable experiment history. Consumer
+restart does not clear the Redis samples, but the bounded retention and TTL
+apply; process-local window contents and the existing startup counters retain
+their prior restart behavior.
+
 ## Important limitations
 
 - The queue is configured for a single active consumer, and each consumer
@@ -631,6 +733,149 @@ Invoke-RestMethod http://127.0.0.1:8000/api/metrics
   unacknowledged message counts are explicitly unavailable.
 - The repository does not define a production deployment configuration or
   pin a Python version.
+
+## Experiment definitions and run history
+
+The experiment API stores reusable experiment definitions and immutable
+configuration snapshots for individual runs in SQLite. SQLite uses Python's
+built-in `sqlite3` module; it does not add a runtime dependency. By default,
+the database is stored in the platform's user-data directory
+(`%LOCALAPPDATA%\\StreamPulse\\experiments.sqlite3` on Windows, or
+`$XDG_DATA_HOME/streampulse/experiments.sqlite3` on other systems). Set
+`STREAMPULSE_EXPERIMENT_DB_PATH` to choose another database file. Experiment
+history is separate from Redis, which continues to hold live monitoring and
+measurement data.
+
+Available endpoints:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/experiments` | Create an experiment |
+| `GET` | `/api/experiments` | List experiments |
+| `GET` | `/api/experiments/{experiment_id}` | Read one experiment and its runs |
+| `PATCH` | `/api/experiments/{experiment_id}` | Update definition metadata/default configuration |
+| `POST` | `/api/experiments/{experiment_id}/runs` | Create a run with a configuration snapshot |
+| `GET` | `/api/experiments/{experiment_id}/runs` | List runs for an experiment |
+| `GET` | `/api/experiments/{experiment_id}/runs/{run_id}` | Read a run |
+| `GET` | `/api/experiments/{experiment_id}/runs/{run_id}/execution` | Read workload claim state and publish progress |
+| `POST` | `/api/experiments/{experiment_id}/runs/{run_id}/execute` | Accept bounded asynchronous workload execution |
+| `GET` | `/api/experiments/{experiment_id}/runs/{run_id}/results` | Read persisted terminal results |
+| `POST` | `/api/experiments/{experiment_id}/runs/{run_id}/start` | Mark a created run as running |
+| `POST` | `/api/experiments/{experiment_id}/runs/{run_id}/complete` | Request completion; persist stop intent and return HTTP 202 |
+| `POST` | `/api/experiments/{experiment_id}/runs/{run_id}/fail` | Request failure; persist stop intent and return HTTP 202 |
+| `POST` | `/api/experiments/{experiment_id}/runs/{run_id}/cancel` | Request cancellation; persist stop intent and return HTTP 202 |
+
+Run states are `CREATED`, `RUNNING`, `COMPLETED`, `FAILED`, and `CANCELLED`.
+Only legal state transitions are accepted; terminal results are persisted and
+cannot be overwritten. Each experiment has a bounded default workload
+configuration: a target from 1–10,000 events, a publish interval from
+10 to 60,000 ms, and positive weights for supported event types. A run copies these
+settings into an immutable workload snapshot; an override can be supplied when
+creating a run. Existing clients receive defaults of 100 events, 100 ms, and
+equal weights for the three supported event types. Starting a run still only
+changes its lifecycle status. The separate execute endpoint claims an already
+RUNNING run and accepts its bounded workload asynchronously. Workload publishes
+are sequential within an API process and globally spaced by at least 10 ms;
+each run also waits its configured interval between events. Execution does not
+automatically complete, fail, or cancel the run. If the API process stops, the
+workload is not resumed. A lease may expire while its owner is paused or an
+operation is still in flight; expiry alone does not prove that owner has stopped.
+The runner checks lease loss after reserving an event and immediately before
+calling the publisher. This is an in-process check, not distributed fencing:
+lease expiry in the tiny interval between that check and broker invocation
+cannot be prevented by this mechanism. Shutdown cancellation after publisher
+invocation attempts to mark the reservation publish-unknown; if that write
+cannot be confirmed, the reservation remains pending. Phase 3C.3 can inventory
+that reservation and record operator evidence, but cannot release or settle it.
+If task creation fails after a claim is acquired, the claim is released when
+possible; because released claims are not reacquirable, that run remains
+fail-closed.
+
+The execution foundation provides an internal SQLite claim service for RUNNING
+runs. Claims use a private owner token and a 60-second default lease (1 to 3,600 seconds allowed). Claim acquisition and closing the event-ingestion gate are serialized in SQLite. The `/complete`, `/fail`, and `/cancel` routes persist a stop intent, close the gate, and return HTTP 202 while the actual run status remains nonterminal. An active runner observes the intent and drains cooperatively; the routes do not synchronously finalize the run; a background finalizer runs after runner shutdown when durable accounting permits, and repeating the stop request permits a later safe attempt if pending work blocked finalization. Owners can renew, release, and update progress. A released claim cannot be reacquired. A read may report a lease-expired claim before interruption is durably recorded; `execution.interruption_recorded` distinguishes that projection from a persisted interruption. When a transactional operation recognizes expiry, it records `execution.interrupted_at` and a bounded reason, clears the owner token, and closes run-scoped event admission atomically. Existing reservations and in-flight broker calls remain accountable and may still settle. The run lifecycle status and result are unchanged. Expired and released claims are never automatically reacquired, and workload resumption is disabled because RabbitMQ does not enforce a fencing token. Progress updates require a run-scoped operation ID: retrying the same ID and payload is a no-op, while reusing an ID with a different owner or payload is rejected. Progress is exposed without the owner token and separates planned, generated, publish-confirmed, publish-failed, and publish-unknown events. Publish progress does not mean consumer processing succeeded.
+
+Run-scoped event submissions are accepted only while the corresponding run
+is `RUNNING`. SQLite reserves each event before the broker publish, and the
+consumer checks and settles that reservation after recording its processing
+outcome. A stop request closes the run's event submission gate transactionally
+and returns `202` with a pending count; the run remains nonterminal while
+accepted work is drained. Publish failures release eligible unclaimed
+reservations. The API and consumer must use the same
+`STREAMPULSE_EXPERIMENT_DB_PATH` when it is configured. This accounting
+preserves the existing at-least-once processing behavior; it is not an
+exactly-once guarantee. A consumer or host failure can leave a reservation
+pending until RabbitMQ redelivers the message and the consumer can settle it.
+Runner generation progress is recorded before the event reservation. An
+interruption in between can therefore leave generated progress without a
+matching reservation; no event identity is available for that gap, and the
+system does not infer that it was published or create a synthetic reservation.
+Run-scoped tumbling and sliding windows are held in consumer memory. After a
+consumer restart the immutable run configuration is loaded again, but partial
+window buffers are lost; Redis retains only summaries already written. Final
+run summaries include completed tumbling windows only; incomplete windows are
+not flushed. A redelivered event may be aggregated again under the existing
+at-least-once processing semantics.
+The publisher uses explicit publisher confirms and mandatory routing. A
+timeout or connection loss after publishing begins can leave broker acceptance
+unknown; such reservations are retained and shown as `unresolved_publish_count`
+on the run detail endpoint. They block terminal transitions until the matching
+delivery is durably settled. The API never republishes an unknown event because
+doing so could duplicate aggregation under at-least-once processing.
+
+Use `GET /api/experiments/{experiment_id}/runs/{run_id}/pending-events` to
+inspect every reservation row that currently blocks terminal transition. Its
+`summary.pending_count` covers all rows matching the terminal gate predicate;
+`summary.unresolved_publish_count` retains its narrower meaning of rows with
+`publish_unknown = 1` and `settled = 0`. These counts are intentionally
+different.
+
+Inventory classifications describe persisted fields only. `PUBLISH_UNKNOWN_MARKER_PERSISTED`
+means the marker was saved. `PUBLISHED_FLAG_SET` means the published flag was
+saved, either from publisher confirmation or recorded consumer delivery; the
+database does not distinguish those proof paths. `PUBLISH_OUTCOME_NOT_ESTABLISHED`
+includes `RESERVED, published=0, publish_unknown=0` and is uncertain: it does
+not prove the publisher was never invoked. Processing state or positive
+`in_flight_deliveries` records a consumer claim, not a live handler. A settled
+row records a durable consumer receipt, not a successful RabbitMQ ACK.
+Finalization waits for drained durable accounting and does not prove that broker
+ACK settlement completed.
+
+The storage layer can record operator-supplied reconciliation evidence for a
+specific run/event and the row state observed at that time. It deliberately
+does not release or settle reservations: StreamPulse has no independently
+verifiable per-event broker evidence, so the supplied evidence reference cannot
+authorize a state change. Missing or unverified evidence leaves the reservation
+pending. Queue depth, an empty queue snapshot, consumer count, missing Redis
+measurements, or a free-form assertion alone cannot prove that a message cannot
+still be delivered. Never delete a reservation directly or change its receipt
+outcome to `SUCCESS` to clear pending work. The inventory includes all unsettled
+rows, including rows with `publish_unknown = 0`, because a failed or interrupted
+outcome write can leave such a row even when publishing may have begun.
+Per-event accounting rows are removed when the terminal result is committed;
+the result retains aggregate accepted and processed counts.
+
+The terminal result snapshot includes the run configuration, timestamps,
+consumer delivery-attempt and unique-event counters, average and P95 measured
+consumer processing latency, failure rate, and a completeness indicator. A
+benchmark throughput value is derived only for a completed run as unique
+successful event IDs divided by the measured run duration. The historical
+`inter_arrival_rate_events_per_second` metric is a separate arrival-rate
+estimate and must not be interpreted as benchmark throughput. If measurements
+are unavailable, the duration is zero, or the result counters cannot be
+reconciled, the API reports an incomplete result and explains why; it does not
+fill missing measurements with zero. Redis telemetry remains best-effort and
+bounded, so SQLite preserves result snapshots but cannot restore samples that
+were unavailable when the run ended. Result export and automated comparisons
+are not implemented in this phase. `result_complete` covers completed-run throughput prerequisites,
+measurement availability, positive duration, counter consistency, and agreement
+between Redis counters and the durable accepted/processed event counts.
+`result_complete` also requires generated progress to reach the planned event
+count; results include planned, generated, remaining, and shortfall counts.
+Finalization waits for drained durable accounting, not confirmed RabbitMQ ACK
+settlement. `latency_complete` separately requires at least one
+`consumer_processing_latency_ms` sample with both average and P95 values;
+missing latency samples are listed in `latency_incomplete_reasons`. A valid
+throughput result can therefore coexist with incomplete latency measurements.
 
 ## Proposed future scope
 

@@ -121,7 +121,7 @@ function monitoringFailed() {
 
 function monitoringUnavailableInformation() {
   if (monitoringLoading()) return ["Loading component monitoring…"];
-  if (monitoringFailed()) return ["Monitoring data is unavailable because the latest monitoring request failed. No component failure is inferred from that request failure."];
+  if (monitoringFailed()) return ["The monitoring request failed; component status is unconfirmed."];
   return ["This component's monitoring data was not returned."];
 }
 
@@ -206,7 +206,7 @@ function consumerInformation() {
   if (note) info.push(note);
   if (consumer.status === "unavailable") {
     const reasons = {
-      not_initialized: "Consumer monitoring has not been initialized; this does not mean the consumer crashed.",
+      not_initialized: "No consumer heartbeat is recorded; current consumer state is unknown.",
       monitoring_not_configured: "Consumer monitoring is not configured.",
       redis_unavailable: "The API could not read consumer monitoring data from Redis.",
       invalid_snapshot: "The stored consumer monitoring snapshot is invalid.",
@@ -659,7 +659,7 @@ async function loadMonitoring() {
     architectureState.rabbitmq = "not_verified";
     architectureState.redis = "not_verified";
     setApiStatus(false, "API unavailable");
-    // A failed API monitoring request does not prove that RabbitMQ or Redis is down.
+    // Monitoring failures leave RabbitMQ and Redis status unconfirmed.
     setServiceStatus(rabbitStatus, "RabbitMQ", "not_verified");
     setServiceStatus(redisStatus, "Redis", "not_verified");
     renderArchitectureStatuses();
@@ -864,6 +864,10 @@ async function loadEvents() {
 }
 
 async function refreshLiveData() {
+  if (normalizedRoute() !== "dashboard") {
+    window.clearTimeout(refreshTimer);
+    return;
+  }
   if (activeRefresh) return activeRefresh;
   activeRefresh = Promise.allSettled([
     loadMonitoring(),
@@ -880,7 +884,7 @@ async function refreshLiveData() {
 
 function scheduleRefresh() {
   window.clearTimeout(refreshTimer);
-  if (document.hidden) return;
+  if (document.hidden || normalizedRoute() !== "dashboard") return;
   refreshTimer = window.setTimeout(async () => {
     await refreshLiveData();
     scheduleRefresh();
@@ -997,11 +1001,1240 @@ actionForm.addEventListener("submit", async (event) => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) window.clearTimeout(refreshTimer);
-  else {
+  else if (normalizedRoute() === "dashboard") {
     void refreshLiveData();
     scheduleRefresh();
   }
 });
 window.addEventListener("pagehide", () => window.clearTimeout(refreshTimer));
 
-void refreshLiveData().finally(scheduleRefresh);
+function normalizedRoute(pathname = window.location.pathname) {
+  const path = pathname.replace(/\/+$/, "") || "/";
+  if (path === "/failure-recovery") return "failureRecovery";
+  if (path === "/experiments") return "experiments";
+  if (path === "/experiments/new") return "create";
+  if (/^\/experiments\/[^/]+\/runs\/[^/]+\/results$/.test(path)) return "results";
+  if (/^\/experiments\/[^/]+\/runs\/[^/]+$/.test(path)) return "run";
+  if (/^\/experiments\/[^/]+$/.test(path)) return "details";
+  return "dashboard";
+}
+
+let experimentListRequest = 0;
+let experimentDetailRequest = 0;
+let currentExperiment = null;
+let runRefreshInFlight = false;
+let runRefreshQueued = false;
+let runActionInFlight = false;
+let runPageSnapshot = null;
+let resultsRefreshInFlight = false;
+let resultsRefreshQueued = false;
+let resultsRefreshRouteKey = null;
+let resultsPageSnapshot = null;
+let comparisonRequestId = 0;
+let comparisonEligibleRuns = [];
+let selectedComparisonRunIds = new Set();
+
+function experimentElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined && text !== null && text !== "") element.textContent = String(text);
+  return element;
+}
+
+function formatExperimentDate(value) {
+  if (!value) return "Unavailable";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Unavailable" : date.toLocaleString();
+}
+
+function experimentSummary(experiment) {
+  const config = experiment.default_configuration || {};
+  const workload = experiment.default_workload_configuration || {};
+  const windowSummary = Number.isInteger(config.tumbling_size) && Number.isInteger(config.sliding_size)
+    && Number.isInteger(config.sliding_interval)
+    ? `Tumbling ${config.tumbling_size} · Sliding ${config.sliding_size} / ${config.sliding_interval}`
+    : "Unavailable";
+  const workloadSummary = Number.isInteger(workload.target_event_count)
+    && Number.isInteger(workload.publish_interval_ms)
+    ? `${workload.target_event_count.toLocaleString()} events · ${workload.publish_interval_ms} ms`
+    : "Unavailable";
+  return { windowSummary, workloadSummary };
+}
+
+function setExperimentListState(state) {
+  document.getElementById("experiments-loading").hidden = state !== "loading";
+  document.getElementById("experiments-error").hidden = state !== "error";
+  document.getElementById("experiments-empty").hidden = state !== "empty";
+  document.getElementById("experiments-results").hidden = state !== "results";
+  document.getElementById("experiments-header-create").hidden = state !== "results";
+}
+
+function renderExperiments(experiments) {
+  const tbody = document.getElementById("experiments-table-body");
+  const cards = document.getElementById("experiments-cards");
+  tbody.replaceChildren();
+  cards.replaceChildren();
+  const types = new Set();
+
+  for (const experiment of experiments) {
+    if (experiment.experiment_type) types.add(experiment.experiment_type);
+    const { windowSummary, workloadSummary } = experimentSummary(experiment);
+    const name = experimentElement("span", "experiment-row-name", experiment.name || "Unnamed experiment");
+    const description = experimentElement("span", "experiment-row-description", experiment.description || "No description");
+    const nameCell = experimentElement("td");
+    nameCell.append(name, description);
+    const typeCell = experimentElement("td");
+    typeCell.append(experimentElement("span", "experiment-type-tag", String(experiment.experiment_type || "Unavailable").replaceAll("_", " ")));
+    const row = document.createElement("tr");
+    row.append(nameCell, typeCell,
+      experimentElement("td", "", formatExperimentDate(experiment.updated_at)),
+      experimentElement("td", "", windowSummary),
+      experimentElement("td", "", workloadSummary));
+    const actionCell = document.createElement("td");
+    const detailLink = experimentElement("a", "secondary-action-button compact-action", "View Details");
+    detailLink.href = `/experiments/${encodeURIComponent(experiment.experiment_id)}`;
+    detailLink.dataset.routeLink = "";
+    actionCell.append(detailLink);
+    row.append(actionCell);
+    tbody.append(row);
+
+    const card = experimentElement("article", "panel experiment-mobile-card");
+    const cardHead = experimentElement("div", "experiment-mobile-card-heading");
+    cardHead.append(experimentElement("div", "", experiment.name || "Unnamed experiment"),
+      experimentElement("span", "experiment-type-tag", String(experiment.experiment_type || "Unavailable").replaceAll("_", " ")));
+    card.append(cardHead, experimentElement("p", "experiment-row-description", experiment.description || "No description"));
+    const details = experimentElement("dl", "experiment-mobile-details");
+    for (const [label, value] of [["Last updated", formatExperimentDate(experiment.updated_at)], ["Window defaults", windowSummary], ["Workload defaults", workloadSummary]]) {
+      details.append(experimentElement("dt", "", label), experimentElement("dd", "", value));
+    }
+    card.append(details);
+    const mobileDetailLink = experimentElement("a", "secondary-action-button compact-action", "View Details");
+    mobileDetailLink.href = `/experiments/${encodeURIComponent(experiment.experiment_id)}`;
+    mobileDetailLink.dataset.routeLink = "";
+    card.append(mobileDetailLink);
+    cards.append(card);
+  }
+
+  document.getElementById("experiments-total-count").textContent = experiments.length.toLocaleString();
+  document.getElementById("experiments-type-count").textContent = String(types.size);
+  setExperimentListState(experiments.length ? "results" : "empty");
+}
+
+async function loadExperiments() {
+  const requestId = ++experimentListRequest;
+  setExperimentListState("loading");
+  try {
+    const response = await fetch("/api/experiments", { headers: { Accept: "application/json" } });
+    let body;
+    try { body = await response.json(); } catch { body = null; }
+    if (!response.ok) throw new Error(typeof body?.detail === "string" ? body.detail : `Could not load experiments (${response.status}).`);
+    if (!Array.isArray(body?.experiments)) throw new Error("The API returned an invalid experiment list.");
+    if (requestId === experimentListRequest && normalizedRoute() === "experiments") renderExperiments(body.experiments);
+  } catch (error) {
+    if (requestId !== experimentListRequest || normalizedRoute() !== "experiments") return;
+    document.getElementById("experiments-error-detail").textContent = error.message || "Could not load experiments.";
+    setExperimentListState("error");
+  }
+}
+
+function setExperimentDetailState(state) {
+  document.getElementById("experiment-detail-loading").hidden = state !== "loading";
+  document.getElementById("experiment-detail-error").hidden = state !== "error";
+  document.getElementById("experiment-detail-missing").hidden = state !== "missing";
+  document.getElementById("experiment-detail-content").hidden = state !== "ready";
+}
+
+function displayValue(value, suffix = "") {
+  return Number.isInteger(value) ? `${value.toLocaleString()}${suffix}` : "Unavailable";
+}
+
+function renderExperimentDetail(experiment) {
+  currentExperiment = experiment;
+  document.getElementById("experiment-detail-title").textContent = experiment.name || "Unnamed experiment";
+  document.getElementById("experiment-detail-description").textContent = experiment.description || "Saved experiment definition and default run configuration.";
+  document.getElementById("experiment-detail-description-value").textContent = experiment.description || "No description";
+  document.getElementById("experiment-detail-type").textContent = String(experiment.experiment_type || "Unavailable").replaceAll("_", " ");
+  document.getElementById("experiment-detail-id").textContent = experiment.experiment_id || "Unavailable";
+  document.getElementById("experiment-detail-created").textContent = formatExperimentDate(experiment.created_at);
+
+  const config = experiment.default_configuration || {};
+  const workload = experiment.default_workload_configuration || {};
+  document.getElementById("detail-tumbling-size").textContent = displayValue(config.tumbling_size, " events");
+  document.getElementById("detail-sliding-size").textContent = displayValue(config.sliding_size, " events");
+  document.getElementById("detail-sliding-interval").textContent = displayValue(config.sliding_interval, " events");
+  document.getElementById("detail-target-count").textContent = displayValue(workload.target_event_count, " events");
+  document.getElementById("detail-publish-interval").textContent = displayValue(workload.publish_interval_ms, " ms");
+  const distribution = workload.event_type_distribution;
+  const distributionText = distribution && typeof distribution === "object" && Object.keys(distribution).length
+    ? Object.entries(distribution).map(([type, weight]) => `${type.replaceAll("_", " ")} (weight ${weight})`).join(", ")
+    : "Unavailable";
+  document.getElementById("detail-event-distribution").textContent = distributionText;
+  setExperimentDetailState("ready");
+}
+
+async function loadExperimentDetail() {
+  const requestId = ++experimentDetailRequest;
+  const pathId = window.location.pathname.replace(/\/+$/, "").split("/").at(-1);
+  setExperimentDetailState("loading");
+  try {
+    const response = await fetch(`/api/experiments/${encodeURIComponent(pathId)}`, { headers: { Accept: "application/json" } });
+    let body;
+    try { body = await response.json(); } catch { body = null; }
+    if (response.status === 404) {
+      if (requestId === experimentDetailRequest && normalizedRoute() === "details") setExperimentDetailState("missing");
+      return;
+    }
+    if (!response.ok) throw new Error(typeof body?.detail === "string" ? body.detail : `Could not load experiment (${response.status}).`);
+    if (!body?.experiment_id) throw new Error("The API returned an invalid experiment definition.");
+    if (requestId === experimentDetailRequest && normalizedRoute() === "details") renderExperimentDetail(body);
+  } catch (error) {
+    if (requestId !== experimentDetailRequest || normalizedRoute() !== "details") return;
+    document.getElementById("experiment-detail-error-message").textContent = error.message || "Could not load experiment.";
+    setExperimentDetailState("error");
+  }
+}
+
+function showExperimentDetailMessage(message, kind = "success") {
+  const box = document.getElementById("experiment-detail-message");
+  box.textContent = message;
+  box.className = `form-submit-message${kind === "success" ? " success" : ""}`;
+  box.hidden = false;
+}
+
+function syncEditSlidingOptions() {
+  const size = Number(document.getElementById("edit-sliding-size").value);
+  const select = document.getElementById("edit-sliding-interval");
+  const previous = Number(select.value) || 1;
+  select.replaceChildren();
+  for (let interval = 1; interval < size; interval += 1) {
+    const option = experimentElement("option", "", `${interval} ${interval === 1 ? "event" : "events"}`);
+    option.value = String(interval);
+    select.append(option);
+  }
+  select.value = String(Math.min(previous, size - 1));
+}
+
+function populateExperimentEditForm(experiment) {
+  const config = experiment.default_configuration || {};
+  const workload = experiment.default_workload_configuration || {};
+  document.getElementById("edit-experiment-name").value = experiment.name || "";
+  document.getElementById("edit-experiment-description").value = experiment.description || "";
+  document.getElementById("edit-experiment-type").value = experiment.experiment_type || "window_performance";
+  document.getElementById("edit-tumbling-size").value = String(config.tumbling_size ?? "");
+  document.getElementById("edit-sliding-size").value = String(config.sliding_size ?? "");
+  document.getElementById("edit-target-count").value = String(workload.target_event_count ?? "");
+  document.getElementById("edit-publish-interval").value = String(workload.publish_interval_ms ?? "");
+  for (const checkbox of document.querySelectorAll('input[name="edit-event-type"]')) {
+    const weight = workload.event_type_distribution?.[checkbox.value];
+    checkbox.checked = Number.isInteger(weight);
+    document.querySelector(`[data-edit-event-weight="${checkbox.value}"]`).value = Number.isInteger(weight) ? String(weight) : "1";
+  }
+  syncEditSlidingOptions();
+  document.getElementById("edit-sliding-interval").value = String(config.sliding_interval ?? "");
+  document.getElementById("experiment-edit-message").hidden = true;
+}
+
+document.getElementById("experiment-detail-retry").addEventListener("click", () => { void loadExperimentDetail(); });
+document.getElementById("experiment-edit-toggle").addEventListener("click", () => {
+  if (!currentExperiment) return;
+  const panel = document.getElementById("experiment-edit-panel");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) {
+    populateExperimentEditForm(currentExperiment);
+    panel.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+});
+document.getElementById("experiment-edit-cancel").addEventListener("click", () => {
+  document.getElementById("experiment-edit-panel").hidden = true;
+});
+document.getElementById("edit-sliding-size").addEventListener("change", syncEditSlidingOptions);
+
+document.getElementById("experiment-edit-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!currentExperiment) return;
+  const message = document.getElementById("experiment-edit-message");
+  const name = document.getElementById("edit-experiment-name").value.trim();
+  const description = document.getElementById("edit-experiment-description").value.trim();
+  const tumblingSize = Number(document.getElementById("edit-tumbling-size").value);
+  const slidingSize = Number(document.getElementById("edit-sliding-size").value);
+  const slidingInterval = Number(document.getElementById("edit-sliding-interval").value);
+  const targetCount = Number(document.getElementById("edit-target-count").value);
+  const publishInterval = Number(document.getElementById("edit-publish-interval").value);
+  const selected = [...document.querySelectorAll('input[name="edit-event-type"]:checked')];
+  const validWindow = [5, 8, 10].includes(tumblingSize) && [5, 8, 10].includes(slidingSize) && Number.isInteger(slidingInterval) && slidingInterval > 0 && slidingInterval < slidingSize;
+  const validWorkload = Number.isInteger(targetCount) && targetCount >= 1 && targetCount <= 10000
+    && Number.isInteger(publishInterval) && publishInterval >= 10 && publishInterval <= 60000 && selected.length > 0;
+  const distribution = {};
+  for (const checkbox of selected) {
+    const weight = Number(document.querySelector(`[data-edit-event-weight="${checkbox.value}"]`).value);
+    if (!Number.isInteger(weight) || weight < 1 || weight > 1000) distribution[checkbox.value] = null;
+    else distribution[checkbox.value] = weight;
+  }
+  const invalidWeights = Object.values(distribution).some((weight) => weight === null);
+  if (!name || name.length > 160 || description.length > 2000 || !validWindow || !validWorkload || invalidWeights) {
+    message.textContent = "Check the name and configuration values. Select an event type and use supported whole-number ranges.";
+    message.hidden = false;
+    return;
+  }
+  message.hidden = true;
+  const saveButton = document.getElementById("experiment-edit-save");
+  saveButton.disabled = true;
+  saveButton.textContent = "Saving…";
+  try {
+    const response = await fetch(`/api/experiments/${encodeURIComponent(currentExperiment.experiment_id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        name, description: description || null,
+        experiment_type: document.getElementById("edit-experiment-type").value,
+        default_configuration: { tumbling_size: tumblingSize, sliding_size: slidingSize, sliding_interval: slidingInterval },
+        default_workload_configuration: { target_event_count: targetCount, publish_interval_ms: publishInterval, event_type_distribution: distribution },
+      }),
+    });
+    let body;
+    try { body = await response.json(); } catch { body = null; }
+    if (!response.ok) throw new Error(validationMessage(body));
+    renderExperimentDetail(body);
+    document.getElementById("experiment-edit-panel").hidden = true;
+    showExperimentDetailMessage("Experiment definition updated.");
+  } catch (error) {
+    message.textContent = error.message || "Could not save changes. Your entries are still here.";
+    message.hidden = false;
+  } finally {
+    saveButton.disabled = false;
+    saveButton.textContent = "Save Changes";
+  }
+});
+
+document.getElementById("experiment-create-run").addEventListener("click", async () => {
+  if (!currentExperiment) return;
+  const button = document.getElementById("experiment-create-run");
+  button.disabled = true;
+  button.textContent = "Creating run…";
+  try {
+    const response = await fetch(`/api/experiments/${encodeURIComponent(currentExperiment.experiment_id)}/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: "{}",
+    });
+    let body;
+    try { body = await response.json(); } catch { body = null; }
+    if (!response.ok) throw new Error(validationMessage(body));
+    if (!body?.run_id) throw new Error("The API did not confirm the new run record.");
+    const nextPath = `/experiments/${encodeURIComponent(currentExperiment.experiment_id)}/runs/${encodeURIComponent(body.run_id)}`;
+    window.history.pushState({}, "", nextPath);
+    renderRoute();
+    window.scrollTo({ top: 0, behavior: "auto" });
+  } catch (error) {
+    showExperimentDetailMessage(error.message || "Could not create the run record.", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Create New Run";
+  }
+});
+
+function runRouteIds() {
+  const segments = window.location.pathname.replace(/\/+$/, "").split("/");
+  return { experimentId: segments[2], runId: segments[4] };
+}
+
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  let body;
+  try { body = await response.json(); } catch { body = null; }
+  return { response, body };
+}
+
+function runUnavailable(value, suffix = "") {
+  return Number.isFinite(value) ? `${value.toLocaleString()}${suffix}` : "Unavailable";
+}
+
+function runMetric(value, suffix = "") {
+  return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(2)}${suffix}` : "Unavailable";
+}
+
+function runEndpointPath(experimentId, runId, suffix = "") {
+  return `/api/experiments/${encodeURIComponent(experimentId)}/runs/${encodeURIComponent(runId)}${suffix}`;
+}
+
+function setRunError(message, missing = false) {
+  const hasPriorData = Boolean(runPageSnapshot);
+  document.getElementById("run-page-loading").hidden = true;
+  document.getElementById("run-page-missing").hidden = !missing;
+  const errorPanel = document.getElementById("run-page-error");
+  errorPanel.hidden = missing || (hasPriorData && !message);
+  document.getElementById("run-page-error-message").textContent = message || "Could not load this run.";
+  document.getElementById("run-page-content").hidden = missing || !hasPriorData;
+}
+
+function setRunText(id, value) {
+  document.getElementById(id).textContent = value === null || value === undefined || value === "" ? "Unavailable" : String(value);
+}
+
+function renderRunTimeline(run) {
+  const entries = [];
+  if (run.created_at) entries.push({ at: run.created_at, label: "Run created" });
+  if (run.started_at) entries.push({ at: run.started_at, label: "Run started" });
+  if (run.stop_intent?.requested_at) {
+    entries.push({ at: run.stop_intent.requested_at, label: `Stop requested · ${run.stop_intent.target}`,
+      detail: run.stop_intent.reason || "" });
+  }
+  if (run.execution?.interrupted_at) {
+    entries.push({ at: run.execution.interrupted_at, label: "Execution interrupted",
+      detail: run.execution.interruption_reason || "" });
+  }
+  const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(run.status);
+  if (terminal && run.ended_at) entries.push({ at: run.ended_at, label: `Run ${run.status.toLowerCase()}`,
+    detail: run.status === "FAILED" ? (run.failure_reason || "") : "" });
+  entries.sort((left, right) => new Date(left.at).getTime() - new Date(right.at).getTime());
+  const timeline = document.getElementById("run-timeline");
+  timeline.replaceChildren();
+  for (const entry of entries) {
+    const item = document.createElement("li");
+    const heading = experimentElement("strong", "", entry.label);
+    const date = experimentElement("time", "", formatExperimentDate(entry.at));
+    date.dateTime = entry.at;
+    item.append(heading, date);
+    if (entry.detail) item.append(experimentElement("p", "", entry.detail));
+    timeline.append(item);
+  }
+  document.getElementById("run-timeline-empty").hidden = entries.length > 0;
+}
+
+function renderRunControls(run) {
+  const status = String(run.status || "Unavailable");
+  const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(status);
+  const draining = !terminal && Boolean(run.stop_intent);
+  const badge = document.getElementById("run-status-badge");
+  badge.textContent = draining ? `DRAINING · ${run.stop_intent.target} requested` : status;
+  badge.className = `run-status-badge status-${status.toLowerCase()}${draining ? " status-draining" : ""}`;
+
+  const note = document.getElementById("run-lifecycle-note");
+  note.hidden = true;
+  if (draining) {
+    note.textContent = `Stop requested for ${run.stop_intent.target}. The run is draining; its terminal status will appear after finalization.`;
+    note.hidden = false;
+  } else if (run.execution?.interruption_recorded) {
+    note.textContent = `Execution was interrupted${run.execution.interruption_reason ? `: ${run.execution.interruption_reason}` : "."} No resume action is available here.`;
+    note.hidden = false;
+  } else if (run.event_ingestion_closed && !terminal) {
+    note.textContent = "Event ingestion is closed. Awaiting the persisted lifecycle outcome.";
+    note.hidden = false;
+  } else if (status === "FAILED" && run.failure_reason) {
+    note.textContent = run.failure_reason;
+    note.hidden = false;
+  }
+
+  const buttons = document.getElementById("run-control-buttons");
+  buttons.replaceChildren();
+  const resultsLink = experimentElement("a", "secondary-action-button", "View Results");
+  resultsLink.href = `/experiments/${encodeURIComponent(run.experiment_id)}/runs/${encodeURIComponent(run.run_id)}/results`;
+  resultsLink.dataset.routeLink = "";
+  buttons.append(resultsLink);
+  if (status === "CREATED") {
+    const start = experimentElement("button", "primary-action-button", "Start Run");
+    start.type = "button";
+    start.disabled = runActionInFlight;
+    start.addEventListener("click", startExperimentRun);
+    buttons.append(start);
+  } else if (status === "RUNNING" && !draining) {
+    const stop = experimentElement("button", "secondary-action-button", "Stop Run");
+    stop.type = "button";
+    stop.disabled = runActionInFlight;
+    stop.addEventListener("click", stopExperimentRun);
+    buttons.append(stop);
+  }
+};
+
+function renderRunMeasurements(snapshot) {
+  const run = snapshot.run;
+  const finalResults = snapshot.results?.results || null;
+  const summary = finalResults
+    ? (finalResults.measurements_available ? finalResults.measurements : null)
+    : snapshot.measurements;
+  const hasMeasurements = Boolean(summary?.measurements_present);
+  const average = hasMeasurements ? summary.average_latency_ms?.consumer_processing_latency_ms : null;
+  const p95 = hasMeasurements ? summary.p95_latency_ms?.consumer_processing_latency_ms : null;
+  const sampleCount = hasMeasurements ? summary.sample_count?.consumer_processing_latency_ms : null;
+  const throughput = hasMeasurements ? summary.throughput_events_per_second : null;
+  setRunText("run-throughput-value", runMetric(throughput, " events/s"));
+  setRunText("run-average-latency", runMetric(average, " ms"));
+  setRunText("run-p95-latency", runMetric(p95, " ms"));
+  setRunText("run-final-throughput", runMetric(finalResults?.benchmark_throughput_events_per_second, " events/s"));
+
+  const resultComplete = document.getElementById("run-result-completeness");
+  const latencyComplete = document.getElementById("run-latency-completeness");
+  if (finalResults) {
+    resultComplete.textContent = `Result completeness: ${finalResults.result_complete === true ? "Complete" : finalResults.result_complete === false ? "Incomplete" : "Unavailable"}`;
+    latencyComplete.textContent = `Latency completeness: ${finalResults.latency_complete === true ? "Complete" : finalResults.latency_complete === false ? "Incomplete" : "Unavailable"}`;
+    resultComplete.classList.toggle("incomplete", finalResults.result_complete === false);
+    latencyComplete.classList.toggle("incomplete", finalResults.latency_complete === false);
+  } else {
+    const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(run.status);
+    resultComplete.textContent = `Result completeness: ${terminal ? "Unavailable" : "Not finalized"}`;
+    latencyComplete.textContent = `Latency completeness: ${terminal ? "Unavailable" : "Not finalized"}`;
+    resultComplete.classList.remove("incomplete");
+    latencyComplete.classList.remove("incomplete");
+  }
+  let note = hasMeasurements
+    ? `Run-scoped measurement samples: ${runUnavailable(sampleCount)}. Latency completeness is reported separately from result completeness.`
+    : finalResults && !finalResults.measurements_available
+      ? "Finalized results report that run-scoped measurements are unavailable."
+      : "Run-scoped measurements are unavailable or have not been recorded yet.";
+  if (finalResults?.incomplete_reasons?.length) note += ` Result incomplete: ${finalResults.incomplete_reasons.join(" ")}`;
+  if (finalResults?.latency_incomplete_reasons?.length) note += ` Latency incomplete: ${finalResults.latency_incomplete_reasons.join(" ")}`;
+  document.getElementById("run-measurements-note").textContent = note;
+}
+
+function renderRunPage(snapshot) {
+  runPageSnapshot = snapshot;
+  const { run, experiment, execution, measurements, pending, results } = snapshot;
+  const experimentName = experiment?.name || "Unavailable";
+  document.getElementById("run-experiment-name").textContent = experimentName === "Unavailable" ? "" : experimentName;
+  document.getElementById("run-experiment-title-value").textContent = experimentName;
+  document.getElementById("experiment-run-title").textContent = `Run ${run.run_id}`;
+  document.getElementById("run-experiment-id").textContent = run.experiment_id || "Unavailable";
+  document.getElementById("run-run-id").textContent = run.run_id || "Unavailable";
+  document.getElementById("run-created-at").textContent = formatExperimentDate(run.created_at);
+  document.getElementById("run-started-at").textContent = formatExperimentDate(run.started_at);
+  document.getElementById("run-back-to-experiment").href = `/experiments/${encodeURIComponent(run.experiment_id)}`;
+  document.getElementById("run-missing-back-link").href = `/experiments/${encodeURIComponent(run.experiment_id)}`;
+
+  const progress = execution?.progress || run.progress || {};
+  const workload = execution?.workload || run.workload_snapshot || {};
+  const target = Number.isInteger(progress.planned) ? progress.planned : workload.target_event_count;
+  const generated = progress.generated;
+  const accounting = run.event_accounting || {};
+  setRunText("run-progress-target", runUnavailable(target));
+  setRunText("run-progress-generated", runUnavailable(generated));
+  setRunText("run-progress-published", runUnavailable(progress.publish_confirmed));
+  setRunText("run-progress-publish-failed", runUnavailable(progress.publish_failed));
+  setRunText("run-progress-processed", runUnavailable(accounting.consumer_processed_successes));
+  setRunText("run-progress-processing-failed", runUnavailable(accounting.consumer_processed_failures));
+  const draining = Boolean(run.stop_intent || run.event_ingestion_closed || run.execution?.interruption_recorded);
+  setRunText("run-progress-pending", pending?.summary && Number.isInteger(pending.summary.pending_count)
+    ? String(pending.summary.pending_count) : draining ? "Unavailable" : "Unavailable (not in a drain state)");
+  const validProgress = Number.isInteger(target) && target > 0 && Number.isInteger(generated) && generated >= 0 && generated <= target;
+  document.getElementById("run-progress-bar-wrap").hidden = !validProgress;
+  if (validProgress) {
+    const percent = generated / target * 100;
+    document.getElementById("run-progress-bar").value = percent;
+    document.getElementById("run-progress-fraction").textContent = `${generated} / ${target} generated (${percent.toFixed(0)}%)`;
+  }
+  const progressNote = document.getElementById("run-progress-note");
+  progressNote.textContent = execution?.execution?.state === "EXPIRED"
+    ? "Progress counters show the work recorded before the execution interruption."
+    : "Generated, publish-confirmed, and consumer-processed counts are separate backend counters.";
+  progressNote.hidden = false;
+
+  const stopRequested = Boolean(run.stop_intent);
+  const pendingResult = snapshot.pending?.summary;
+  if (stopRequested && pendingResult) {
+    setRunText("run-progress-pending", runUnavailable(pendingResult.pending_count));
+  }
+  renderRunControls(run);
+  renderRunMeasurements(snapshot);
+  renderRunTimeline(run);
+  document.getElementById("run-page-loading").hidden = true;
+  document.getElementById("run-page-error").hidden = true;
+  document.getElementById("run-page-missing").hidden = true;
+  document.getElementById("run-page-content").hidden = false;
+}
+
+async function refreshRunPage() {
+  if (normalizedRoute() !== "run") return;
+  if (runRefreshInFlight) {
+    runRefreshQueued = true;
+    return;
+  }
+  const routeIds = runRouteIds();
+  const routeKey = `${routeIds.experimentId}/${routeIds.runId}`;
+  if (runPageSnapshot && (runPageSnapshot.run.run_id !== routeIds.runId || runPageSnapshot.run.experiment_id !== routeIds.experimentId)) {
+    runPageSnapshot = null;
+  }
+  runRefreshInFlight = true;
+  const refreshButton = document.getElementById("run-refresh-button");
+  const indicator = document.getElementById("run-refresh-indicator");
+  const hadData = Boolean(runPageSnapshot);
+  refreshButton.disabled = true;
+  indicator.textContent = "Refreshing…";
+  if (!hadData) {
+    document.getElementById("run-page-loading").hidden = false;
+    document.getElementById("run-page-error").hidden = true;
+  }
+  try {
+    const { experimentId, runId } = routeIds;
+    const runPath = runEndpointPath(experimentId, runId);
+    const coreResponses = await Promise.all([
+      requestJson(runPath, { headers: { Accept: "application/json" } }),
+      requestJson(`/api/experiments/${encodeURIComponent(experimentId)}`, { headers: { Accept: "application/json" } }),
+      requestJson(`${runPath}/execution`, { headers: { Accept: "application/json" } }),
+    ]);
+    const [runResponse, experimentResponse, executionResponse] = coreResponses;
+    if (normalizedRoute() !== "run" || `${runRouteIds().experimentId}/${runRouteIds().runId}` !== routeKey) return;
+    if (runResponse.response.status === 404 || experimentResponse.response.status === 404) {
+      setRunError("Run or experiment was not found.", true);
+      return;
+    }
+    for (const [response, body, label] of [[runResponse.response, runResponse.body, "run"], [experimentResponse.response, experimentResponse.body, "experiment"], [executionResponse.response, executionResponse.body, "execution progress"]]) {
+      if (!response.ok) throw new Error(typeof body?.detail === "string" ? body.detail : `Could not load ${label} (${response.status}).`);
+    }
+    const run = { ...runResponse.body, ...{ event_accounting: runResponse.body.event_accounting } };
+    const needsPending = Boolean(run.stop_intent || run.event_ingestion_closed || run.execution?.interruption_recorded);
+    const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(run.status);
+    const optionalSpecs = [
+      ["measurements", `/api/measurements?run_id=${encodeURIComponent(runId)}`],
+      ...(needsPending ? [["pending", `${runPath}/pending-events`]] : []),
+      ...(terminal && run.result_available ? [["results", `${runPath}/results`]] : []),
+    ];
+    const optional = await Promise.all(optionalSpecs.map(async ([key, url]) => {
+      try {
+        const result = await requestJson(url, { headers: { Accept: "application/json" } });
+        if (key === "results" && result.response.status === 409) return [key, null, null];
+        if (!result.response.ok) throw new Error(typeof result.body?.detail === "string" ? result.body.detail : `${key} unavailable (${result.response.status}).`);
+        return [key, result.body, null];
+      } catch (error) {
+        return [key, null, error.message || `${key} unavailable.`];
+      }
+    }));
+    if (normalizedRoute() !== "run" || `${runRouteIds().experimentId}/${runRouteIds().runId}` !== routeKey) return;
+    const previous = runPageSnapshot || {};
+    const next = { run, experiment: experimentResponse.body, execution: executionResponse.body,
+      measurements: null, pending: null, results: null, optionalWarnings: [] };
+    for (const [key, value, error] of optional) {
+      if (error) {
+        if (previous[key]) next[key] = previous[key];
+        next.optionalWarnings.push(`${key} could not be refreshed; showing the last available value.`);
+      } else next[key] = value;
+    }
+    if (!optionalSpecs.some(([key]) => key === "pending") && previous.pending && needsPending) next.pending = previous.pending;
+    if (!optionalSpecs.some(([key]) => key === "results") && previous.results && terminal && run.result_available) next.results = previous.results;
+    renderRunPage(next);
+    document.getElementById("run-last-updated").textContent = `Last updated ${new Date().toLocaleString()}`;
+    indicator.textContent = next.optionalWarnings.length ? next.optionalWarnings.join(" ") : "";
+  } catch (error) {
+    if (normalizedRoute() === "run" && `${runRouteIds().experimentId}/${runRouteIds().runId}` === routeKey) {
+      setRunError(error.message || "Could not refresh run data.");
+      indicator.textContent = "Refresh failed. Try again; previously displayed data is preserved.";
+    }
+  } finally {
+    runRefreshInFlight = false;
+    refreshButton.disabled = false;
+    const routeChanged = normalizedRoute() === "run" && `${runRouteIds().experimentId}/${runRouteIds().runId}` !== routeKey;
+    const refreshQueued = runRefreshQueued;
+    runRefreshQueued = false;
+    if (normalizedRoute() === "run" && (routeChanged || refreshQueued)) {
+      void refreshRunPage();
+    }
+  }
+}
+
+async function startExperimentRun() {
+  if (runActionInFlight || !runPageSnapshot || runPageSnapshot.run.status !== "CREATED") return;
+  runActionInFlight = true;
+  const message = document.getElementById("run-control-message");
+  message.hidden = false;
+  message.className = "form-submit-message";
+  message.textContent = "Starting the run and submitting it to the controlled workload runner…";
+  document.querySelectorAll("#run-control-buttons button").forEach((button) => { button.disabled = true; });
+  const { experimentId, runId } = runRouteIds();
+  const path = runEndpointPath(experimentId, runId);
+  try {
+    const started = await requestJson(`${path}/start`, { method: "POST", headers: { Accept: "application/json" } });
+    if (!started.response.ok) throw new Error(validationMessage(started.body));
+    const execution = await requestJson(`${path}/execute`, { method: "POST", headers: { Accept: "application/json" } });
+    if (!execution.response.ok) throw new Error(validationMessage(execution.body));
+    message.textContent = "The runner accepted the workload. Refresh for the latest persisted progress.";
+    message.classList.add("success");
+  } catch (error) {
+    message.textContent = `Could not start run execution: ${error.message || "API request failed."} Refresh to verify its persisted state.`;
+    message.classList.add("error");
+  } finally {
+    runActionInFlight = false;
+    await refreshRunPage();
+  }
+}
+
+async function stopExperimentRun() {
+  if (runActionInFlight || !runPageSnapshot || runPageSnapshot.run.status !== "RUNNING" || runPageSnapshot.run.stop_intent) return;
+  runActionInFlight = true;
+  const message = document.getElementById("run-control-message");
+  message.hidden = false;
+  message.className = "form-submit-message";
+  message.textContent = "Submitting stop request…";
+  document.querySelectorAll("#run-control-buttons button").forEach((button) => { button.disabled = true; });
+  const { experimentId, runId } = runRouteIds();
+  try {
+    const result = await requestJson(runEndpointPath(experimentId, runId, "/cancel"), {
+      method: "POST", headers: { Accept: "application/json" },
+    });
+    if (!result.response.ok) throw new Error(validationMessage(result.body));
+    message.textContent = "Stop request accepted. The run is draining; this does not confirm cancellation. Refresh to check finalization.";
+    message.classList.add("success");
+  } catch (error) {
+    message.textContent = `Could not request stop: ${error.message || "API request failed."}`;
+    message.classList.add("error");
+  } finally {
+    runActionInFlight = false;
+    await refreshRunPage();
+  }
+}
+
+document.getElementById("run-refresh-button").addEventListener("click", () => { void refreshRunPage(); });
+document.getElementById("run-page-retry").addEventListener("click", () => { void refreshRunPage(); });
+
+function setResultsError(message, missing = false) {
+  const hasPriorData = Boolean(resultsPageSnapshot);
+  document.getElementById("results-page-loading").hidden = true;
+  document.getElementById("results-page-missing").hidden = !missing;
+  const error = document.getElementById("results-page-error");
+  error.hidden = missing || (hasPriorData && !message);
+  document.getElementById("results-page-error-message").textContent = message || "Could not load this run.";
+  document.getElementById("results-page-content").hidden = missing || !hasPriorData;
+}
+
+function setResultsValue(id, value) {
+  document.getElementById(id).textContent = value === null || value === undefined || value === "" ? "Unavailable" : String(value);
+}
+
+function setCompletenessBadge(element, label, state, incomplete) {
+  element.textContent = `${label}: ${state}`;
+  element.classList.toggle("incomplete", incomplete);
+}
+
+function renderResultsPage(snapshot) {
+  resultsPageSnapshot = snapshot;
+  const { run, experiment, results, measurements: liveMeasurements, pending, optionalWarnings = [] } = snapshot;
+  const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(run.status);
+  const draining = !terminal && Boolean(run.stop_intent);
+  const interrupted = !terminal && Boolean(run.execution?.interruption_recorded);
+  const persisted = results?.results || null;
+  const finalRecordAvailable = Boolean(terminal && persisted);
+  const name = experiment?.name || "Unavailable";
+  document.getElementById("results-experiment-name").textContent = name === "Unavailable" ? "" : name;
+  document.getElementById("experiment-results-title").textContent = `Results · ${run.run_id}`;
+  const statusLabel = terminal ? run.status
+    : interrupted && draining ? `INTERRUPTED · ${run.stop_intent.target} requested`
+      : interrupted ? `INTERRUPTED · ${run.status}`
+        : draining ? `DRAINING · ${run.stop_intent.target} requested`
+          : run.event_ingestion_closed ? `INGESTION CLOSED · ${run.status}` : `PROVISIONAL · ${run.status}`;
+  document.getElementById("results-status").textContent = statusLabel;
+  document.getElementById("results-status").className = `run-status-badge status-${String(run.status || "unavailable").toLowerCase()}${draining || interrupted || run.event_ingestion_closed ? " status-draining" : !terminal ? " status-provisional" : ""}`;
+  document.getElementById("results-experiment-name-value").textContent = name;
+  setResultsValue("results-experiment-id", run.experiment_id);
+  setResultsValue("results-run-id", run.run_id);
+  document.getElementById("results-created-at").textContent = formatExperimentDate(run.created_at);
+  document.getElementById("results-started-at").textContent = formatExperimentDate(run.started_at);
+  document.getElementById("results-ended-at").textContent = run.ended_at ? formatExperimentDate(run.ended_at) : "Unavailable";
+  const runUrl = `/experiments/${encodeURIComponent(run.experiment_id)}/runs/${encodeURIComponent(run.run_id)}`;
+  document.getElementById("results-back-to-run").href = runUrl;
+  document.getElementById("results-back-to-detail").href = `/experiments/${encodeURIComponent(run.experiment_id)}`;
+  document.getElementById("results-missing-back-to-experiment").href = `/experiments/${encodeURIComponent(run.experiment_id)}`;
+
+  const provisionalNote = document.getElementById("results-provisional-note");
+  provisionalNote.hidden = true;
+  if (!terminal) {
+    provisionalNote.textContent = interrupted
+      ? `Execution was interrupted${run.execution.interruption_reason ? `: ${run.execution.interruption_reason}` : "."} ${draining ? `Stop was requested for ${run.stop_intent.target}; the run remains in drain/finalization.` : "The persisted run outcome is not terminal yet."}`
+      : draining
+        ? `Stop requested for ${run.stop_intent.target}. The run is draining; values remain provisional until finalization.`
+        : run.event_ingestion_closed
+          ? "Event ingestion is closed. The run is awaiting its persisted lifecycle outcome; values remain provisional."
+          : `These values are provisional. The run is still ${run.status}; persisted final results and completeness have not been established.`;
+    provisionalNote.hidden = false;
+  } else if (!finalRecordAvailable) {
+    provisionalNote.textContent = "The run is terminal, but a persisted result record is unavailable.";
+    provisionalNote.hidden = false;
+  }
+
+  const progress = run.progress || {};
+  const accounting = run.event_accounting || {};
+  const workload = run.workload_snapshot || {};
+  const pendingApplicable = Boolean(run.stop_intent || run.event_ingestion_closed);
+  setResultsValue("results-target-events", runUnavailable(workload.target_event_count));
+  setResultsValue("results-generated-events", runUnavailable(progress.generated));
+  setResultsValue("results-published-events", runUnavailable(progress.publish_confirmed));
+  setResultsValue("results-processed-events", runUnavailable(accounting.consumer_processed_successes));
+  setResultsValue("results-publish-failures", runUnavailable(progress.publish_failed));
+  setResultsValue("results-processing-failures", runUnavailable(accounting.consumer_processed_failures));
+  const pendingCount = pending?.summary?.pending_count;
+  setResultsValue("results-pending-events", Number.isInteger(pendingCount)
+    ? String(pendingCount) : pendingApplicable ? "Unavailable" : "Unavailable (not in a drain state)");
+
+  const measurements = finalRecordAvailable
+    ? (persisted.measurements_available ? persisted.measurements : null)
+    : (!terminal ? liveMeasurements : null);
+  const measurementsPresent = Boolean(measurements?.measurements_present);
+  const throughput = finalRecordAvailable
+    ? persisted.benchmark_throughput_events_per_second
+    : (!terminal && measurementsPresent ? measurements.throughput_events_per_second : null);
+  const averageLatency = measurementsPresent ? measurements.average_latency_ms?.consumer_processing_latency_ms : null;
+  const p95Latency = measurementsPresent ? measurements.p95_latency_ms?.consumer_processing_latency_ms : null;
+  setResultsValue("results-throughput", runMetric(throughput, " events/s"));
+  setResultsValue("results-average-latency", runMetric(averageLatency, " ms"));
+  setResultsValue("results-p95-latency", runMetric(p95Latency, " ms"));
+
+  const resultBadge = document.getElementById("results-result-complete");
+  const latencyBadge = document.getElementById("results-latency-complete");
+  if (finalRecordAvailable) {
+    setCompletenessBadge(resultBadge, "Result completeness", persisted.result_complete === true ? "Complete" : persisted.result_complete === false ? "Incomplete" : "Unavailable", persisted.result_complete === false);
+    setCompletenessBadge(latencyBadge, "Latency completeness", persisted.latency_complete === true ? "Complete" : persisted.latency_complete === false ? "Incomplete" : "Unavailable", persisted.latency_complete === false);
+  } else if (!terminal) {
+    setCompletenessBadge(resultBadge, "Result completeness", "Provisional", false);
+    setCompletenessBadge(latencyBadge, "Latency completeness", "Provisional", false);
+  } else {
+    setCompletenessBadge(resultBadge, "Result completeness", "Unavailable", false);
+    setCompletenessBadge(latencyBadge, "Latency completeness", "Unavailable", false);
+  }
+  const notes = [];
+  if (persisted?.incomplete_reasons?.length) notes.push(...persisted.incomplete_reasons.map((reason) => `Result: ${reason}`));
+  if (persisted?.latency_incomplete_reasons?.length) notes.push(...persisted.latency_incomplete_reasons.map((reason) => `Latency: ${reason}`));
+  if (!measurementsPresent) notes.push(finalRecordAvailable ? "Persisted run-scoped measurements are unavailable." : "Run-scoped measurements are unavailable or have not been recorded yet.");
+  if (!terminal) notes.push("Provisional measurements may change before finalization.");
+  if (optionalWarnings.length) notes.push(...optionalWarnings);
+  document.getElementById("results-completeness-notes").textContent = notes.join(" ");
+
+  document.getElementById("results-page-loading").hidden = true;
+  document.getElementById("results-page-error").hidden = true;
+  document.getElementById("results-page-missing").hidden = true;
+  document.getElementById("results-page-content").hidden = false;
+}
+
+async function loadComparisonRuns(experimentId, currentRunId) {
+  const requestId = ++comparisonRequestId;
+  const routeMatchesRequest = () => requestId === comparisonRequestId
+    && normalizedRoute() === "results"
+    && runRouteIds().experimentId === experimentId
+    && runRouteIds().runId === currentRunId;
+  document.getElementById("comparison-loading").hidden = false;
+  document.getElementById("comparison-error").hidden = true;
+  document.getElementById("comparison-empty").hidden = true;
+  document.getElementById("comparison-selection-note").hidden = true;
+  document.getElementById("comparison-limitation-note").hidden = true;
+  document.getElementById("comparison-run-selector").hidden = true;
+  document.getElementById("comparison-table-wrap").hidden = true;
+  try {
+    const { response, body } = await requestJson(`/api/experiments/${encodeURIComponent(experimentId)}/runs`, { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(typeof body?.detail === "string" ? body.detail : `Could not load experiment runs (${response.status}).`);
+    if (!Array.isArray(body?.runs)) throw new Error("The API returned an invalid run list.");
+    if (!routeMatchesRequest()) return;
+    comparisonEligibleRuns = body.runs.filter((run) => ["COMPLETED", "FAILED", "CANCELLED"].includes(run.status) && run.result_available === true);
+    const eligibleIds = new Set(comparisonEligibleRuns.map((run) => run.run_id));
+    selectedComparisonRunIds = new Set([...selectedComparisonRunIds].filter((id) => eligibleIds.has(id)));
+    if (!selectedComparisonRunIds.size && eligibleIds.has(currentRunId)) selectedComparisonRunIds.add(currentRunId);
+    if (!comparisonEligibleRuns.length) {
+      document.getElementById("comparison-empty").textContent = "No terminal runs with persisted results are available to compare for this experiment.";
+      document.getElementById("comparison-empty").hidden = false;
+      return;
+    }
+    renderComparisonOptions();
+    await loadSelectedRunComparison();
+  } catch (error) {
+    if (!routeMatchesRequest()) return;
+    document.getElementById("comparison-error-message").textContent = error.message || "Could not load runs for comparison.";
+    document.getElementById("comparison-error").hidden = false;
+  } finally {
+    if (routeMatchesRequest()) document.getElementById("comparison-loading").hidden = true;
+  }
+}
+
+function renderComparisonOptions() {
+  const fieldset = document.getElementById("comparison-run-selector");
+  const options = document.getElementById("comparison-run-options");
+  options.replaceChildren();
+  fieldset.hidden = false;
+  for (const run of comparisonEligibleRuns) {
+    const label = document.createElement("label");
+    label.className = "comparison-run-option";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = run.run_id;
+    checkbox.checked = selectedComparisonRunIds.has(run.run_id);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) selectedComparisonRunIds.add(run.run_id);
+      else selectedComparisonRunIds.delete(run.run_id);
+      void loadSelectedRunComparison();
+    });
+    const configuration = run.configuration_snapshot || {};
+    const workload = run.workload_snapshot || {};
+    const summary = `Target ${Number.isInteger(workload.target_event_count) ? workload.target_event_count : "Unavailable"} · Windows ${configuration.tumbling_size ?? "Unavailable"}/${configuration.sliding_size ?? "Unavailable"}/${configuration.sliding_interval ?? "Unavailable"}`;
+    const text = experimentElement("span", "comparison-run-option-copy", `Run ${run.run_id} · ${run.status} · ${formatExperimentDate(run.created_at)} · ${summary}`);
+    label.append(checkbox, text);
+    options.append(label);
+  }
+  updateComparisonSelectionNote();
+}
+
+function updateComparisonSelectionNote() {
+  const note = document.getElementById("comparison-selection-note");
+  note.textContent = selectedComparisonRunIds.size < 2
+    ? `Select at least two eligible runs to compare (${selectedComparisonRunIds.size} selected).`
+    : `${selectedComparisonRunIds.size} runs selected. All belong to this experiment.`;
+  note.hidden = false;
+}
+
+function comparisonCell(value, suffix = "", completeness = "complete") {
+  const cell = document.createElement("td");
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    cell.textContent = "Unavailable";
+    return cell;
+  }
+  const rendered = Number.isInteger(value) ? value.toLocaleString() : value.toFixed(2);
+  cell.textContent = `${rendered}${suffix}${completeness === "incomplete" ? " · incomplete" : ""}`;
+  if (completeness === "incomplete") cell.className = "comparison-incomplete-value";
+  return cell;
+}
+
+function renderComparisonTable(records) {
+  const head = document.getElementById("comparison-table-head");
+  const body = document.getElementById("comparison-table-body");
+  head.replaceChildren();
+  body.replaceChildren();
+  const headingRow = document.createElement("tr");
+  headingRow.append(experimentElement("th", "", "Metric"));
+  for (const record of records) {
+    const th = document.createElement("th");
+    const wrapper = experimentElement("div", "comparison-column-heading");
+    wrapper.append(experimentElement("strong", "", `Run ${record.run.run_id}`),
+      experimentElement("span", "", record.run.status),
+      experimentElement("small", "", `Result ${record.result.result_complete === true ? "complete" : record.result.result_complete === false ? "incomplete" : "unavailable"} · Latency ${record.result.latency_complete === true ? "complete" : record.result.latency_complete === false ? "incomplete" : "unavailable"}`));
+    th.append(wrapper);
+    headingRow.append(th);
+  }
+  head.append(headingRow);
+  const rows = [
+    ["Generated events", (record) => comparisonCell(record.run.progress?.generated)],
+    ["Publish confirmed", (record) => comparisonCell(record.run.progress?.publish_confirmed)],
+    ["Processed successfully", (record) => comparisonCell(record.result.event_accounting?.consumer_processed_successes)],
+    ["Publish failures", (record) => comparisonCell(record.run.progress?.publish_failed)],
+    ["Processing failures", (record) => comparisonCell(record.result.event_accounting?.consumer_processed_failures)],
+    ["Throughput", (record) => comparisonCell(record.result.benchmark_throughput_events_per_second, " events/s", record.result.result_complete === false ? "incomplete" : "complete")],
+    ["Average processing latency", (record) => comparisonCell(record.result.measurements_available ? record.result.measurements?.average_latency_ms?.consumer_processing_latency_ms : null, " ms", record.result.latency_complete === false ? "incomplete" : "complete")],
+    ["P95 processing latency", (record) => comparisonCell(record.result.measurements_available ? record.result.measurements?.p95_latency_ms?.consumer_processing_latency_ms : null, " ms", record.result.latency_complete === false ? "incomplete" : "complete")],
+  ];
+  for (const [label, render] of rows) {
+    const row = document.createElement("tr");
+    row.append(experimentElement("th", "", label));
+    for (const record of records) row.append(render(record));
+    body.append(row);
+  }
+  document.getElementById("comparison-table-wrap").hidden = false;
+  document.getElementById("comparison-limitation-note").hidden = false;
+}
+
+async function loadSelectedRunComparison() {
+  const route = runRouteIds();
+  const routeKey = `${route.experimentId}/${route.runId}`;
+  const selected = comparisonEligibleRuns.filter((run) => selectedComparisonRunIds.has(run.run_id));
+  updateComparisonSelectionNote();
+  document.getElementById("comparison-error").hidden = true;
+  document.getElementById("comparison-limitation-note").hidden = true;
+  if (selected.length < 2) {
+    document.getElementById("comparison-table-wrap").hidden = true;
+    return;
+  }
+  const requestId = ++comparisonRequestId;
+  const routeMatchesRequest = () => requestId === comparisonRequestId
+    && normalizedRoute() === "results"
+    && `${runRouteIds().experimentId}/${runRouteIds().runId}` === routeKey;
+  document.getElementById("comparison-loading").hidden = false;
+  document.getElementById("comparison-table-wrap").hidden = true;
+  const { experimentId } = route;
+  try {
+    const records = await Promise.all(selected.map(async (run) => {
+      const base = runEndpointPath(experimentId, run.run_id);
+      const [detail, results] = await Promise.all([
+        requestJson(base, { headers: { Accept: "application/json" } }),
+        requestJson(`${base}/results`, { headers: { Accept: "application/json" } }),
+      ]);
+      if (!detail.response.ok) throw new Error(typeof detail.body?.detail === "string" ? detail.body.detail : `Could not load run ${run.run_id}.`);
+      if (!results.response.ok) throw new Error(typeof results.body?.detail === "string" ? results.body.detail : `Could not load persisted results for ${run.run_id}.`);
+      return { run: detail.body, result: results.body.results };
+    }));
+    if (!routeMatchesRequest()) return;
+    renderComparisonTable(records);
+  } catch (error) {
+    if (!routeMatchesRequest()) return;
+    document.getElementById("comparison-error-message").textContent = error.message || "Could not load selected run results.";
+    document.getElementById("comparison-error").hidden = false;
+  } finally {
+    if (routeMatchesRequest()) document.getElementById("comparison-loading").hidden = true;
+  }
+}
+
+async function refreshResultsPage() {
+  if (normalizedRoute() !== "results") return;
+  const routeIds = runRouteIds();
+  const routeKey = `${routeIds.experimentId}/${routeIds.runId}`;
+  if (resultsRefreshInFlight) {
+    if (resultsRefreshRouteKey !== routeKey) resultsRefreshQueued = true;
+    return;
+  }
+  resultsRefreshRouteKey = routeKey;
+  if (resultsPageSnapshot && (resultsPageSnapshot.run.run_id !== routeIds.runId || resultsPageSnapshot.run.experiment_id !== routeIds.experimentId)) {
+    resultsPageSnapshot = null;
+  }
+  resultsRefreshInFlight = true;
+  const button = document.getElementById("results-refresh-button");
+  button.disabled = true;
+  if (!resultsPageSnapshot) {
+    document.getElementById("results-page-loading").hidden = false;
+    document.getElementById("results-page-error").hidden = true;
+  }
+  try {
+    const { experimentId, runId } = routeIds;
+    const base = runEndpointPath(experimentId, runId);
+    const [runResponse, experimentResponse] = await Promise.all([
+      requestJson(base, { headers: { Accept: "application/json" } }),
+      requestJson(`/api/experiments/${encodeURIComponent(experimentId)}`, { headers: { Accept: "application/json" } }),
+    ]);
+    if (normalizedRoute() !== "results" || `${runRouteIds().experimentId}/${runRouteIds().runId}` !== routeKey) return;
+    if (runResponse.response.status === 404 || experimentResponse.response.status === 404) {
+      setResultsError("Run or experiment was not found.", true);
+      return;
+    }
+    for (const [response, body, label] of [[runResponse.response, runResponse.body, "run"], [experimentResponse.response, experimentResponse.body, "experiment"]]) {
+      if (!response.ok) throw new Error(typeof body?.detail === "string" ? body.detail : `Could not load ${label} (${response.status}).`);
+    }
+    const run = runResponse.body;
+    const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(run.status);
+    const pendingApplicable = Boolean(run.stop_intent || run.event_ingestion_closed);
+    const optionalSpecs = [
+      ...(terminal && run.result_available ? [["results", `${base}/results`]] : []),
+      ...(!terminal ? [["measurements", `/api/measurements?run_id=${encodeURIComponent(runId)}`]] : []),
+      ...(pendingApplicable ? [["pending", `${base}/pending-events`]] : []),
+    ];
+    const optionalData = await Promise.all(optionalSpecs.map(async ([key, url]) => {
+      try {
+        const result = await requestJson(url, { headers: { Accept: "application/json" } });
+        if (key === "results" && result.response.status === 409) return [key, null, null];
+        if (!result.response.ok) throw new Error(typeof result.body?.detail === "string" ? result.body.detail : `${key} unavailable (${result.response.status}).`);
+        return [key, result.body, null];
+      } catch (error) {
+        return [key, null, error.message || `${key} unavailable.`];
+      }
+    }));
+    if (normalizedRoute() !== "results" || `${runRouteIds().experimentId}/${runRouteIds().runId}` !== routeKey) return;
+    const previous = resultsPageSnapshot || {};
+    const snapshot = { run, experiment: experimentResponse.body, results: null, measurements: null, pending: null, optionalWarnings: [] };
+    for (const [key, value, error] of optionalData) {
+      if (error) {
+        if (previous[key]) snapshot[key] = previous[key];
+        snapshot.optionalWarnings.push(`${key} could not be refreshed; showing the last available value.`);
+      } else snapshot[key] = value;
+    }
+    if (!optionalSpecs.some(([key]) => key === "pending") && pendingApplicable) snapshot.pending = previous.pending || null;
+    if (!optionalSpecs.some(([key]) => key === "results") && terminal && run.result_available) snapshot.results = previous.results || null;
+    renderResultsPage(snapshot);
+    document.getElementById("results-last-updated").textContent = `Last updated ${new Date().toLocaleString()}`;
+    void loadComparisonRuns(experimentId, runId);
+  } catch (error) {
+    if (normalizedRoute() === "results" && `${runRouteIds().experimentId}/${runRouteIds().runId}` === routeKey) {
+      setResultsError(error.message || "Could not refresh results.");
+    }
+  } finally {
+    resultsRefreshInFlight = false;
+    resultsRefreshRouteKey = null;
+    button.disabled = false;
+    const currentRouteIds = runRouteIds();
+    const routeChanged = normalizedRoute() === "results"
+      && `${currentRouteIds.experimentId}/${currentRouteIds.runId}` !== routeKey;
+    const refreshQueued = resultsRefreshQueued;
+    resultsRefreshQueued = false;
+    if (normalizedRoute() === "results" && (routeChanged || refreshQueued)) {
+      void refreshResultsPage();
+    }
+  }
+}
+
+document.getElementById("results-refresh-button").addEventListener("click", () => { void refreshResultsPage(); });
+document.getElementById("results-page-retry").addEventListener("click", () => { void refreshResultsPage(); });
+document.getElementById("comparison-retry").addEventListener("click", () => {
+  const { experimentId, runId } = runRouteIds();
+  void loadComparisonRuns(experimentId, runId);
+});
+
+function setFieldError(id, message) {
+  const field = document.getElementById(id);
+  if (field) field.textContent = message || "";
+}
+
+function integerField(id, min, max, errorId, label) {
+  const raw = document.getElementById(id).value.trim();
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < min || value > max) {
+    setFieldError(errorId, `${label} must be a whole number from ${min.toLocaleString()} to ${max.toLocaleString()}.`);
+    return null;
+  }
+  setFieldError(errorId, "");
+  return value;
+}
+
+function syncSlidingIntervalOptions() {
+  const size = Number(document.getElementById("default-sliding-size").value);
+  const select = document.getElementById("default-sliding-interval");
+  const previous = Number(select.value) || 1;
+  select.replaceChildren();
+  for (let interval = 1; interval < size; interval += 1) {
+    select.append(experimentElement("option", "", `${interval} ${interval === 1 ? "event" : "events"}`));
+    select.lastElementChild.value = String(interval);
+  }
+  select.value = String(Math.min(previous, size - 1));
+}
+
+function validationMessage(body) {
+  if (typeof body?.detail === "string") return body.detail;
+  if (Array.isArray(body?.detail)) return body.detail.map((item) => item?.msg).filter(Boolean).join(" ") || "The API rejected this experiment definition.";
+  return "The API rejected this experiment definition.";
+}
+
+function validateExperimentForm() {
+  let valid = true;
+  const name = document.getElementById("experiment-name").value.trim();
+  const description = document.getElementById("experiment-description").value.trim();
+  setFieldError("experiment-name-error", name ? "" : "Enter an experiment name.");
+  if (!name) valid = false;
+  setFieldError("experiment-description-error", description.length > 2000 ? "Description must be 2,000 characters or fewer." : "");
+  if (description.length > 2000) valid = false;
+
+  const tumblingSize = Number(document.getElementById("default-tumbling-size").value);
+  const slidingSize = Number(document.getElementById("default-sliding-size").value);
+  const slidingInterval = Number(document.getElementById("default-sliding-interval").value);
+  const supportedSizes = [5, 8, 10];
+  setFieldError("tumbling-size-error", supportedSizes.includes(tumblingSize) ? "" : "Choose a supported window size.");
+  setFieldError("sliding-size-error", supportedSizes.includes(slidingSize) ? "" : "Choose a supported window size.");
+  setFieldError("sliding-interval-error", Number.isInteger(slidingInterval) && slidingInterval > 0 && slidingInterval < slidingSize ? "" : "Interval must be smaller than the sliding window.");
+  if (!supportedSizes.includes(tumblingSize) || !supportedSizes.includes(slidingSize) || !(slidingInterval > 0 && slidingInterval < slidingSize)) valid = false;
+
+  const target = integerField("target-event-count", 1, 10000, "target-event-count-error", "Target events");
+  const publishInterval = integerField("publish-interval-ms", 10, 60000, "publish-interval-error", "Publish interval");
+  if (target === null || publishInterval === null) valid = false;
+  const selected = [...document.querySelectorAll('input[name="event_type"]:checked')];
+  setFieldError("event-distribution-error", selected.length ? "" : "Select at least one supported event type.");
+  if (!selected.length) valid = false;
+  const distribution = {};
+  for (const checkbox of selected) {
+    const weightInput = document.querySelector(`[data-event-weight="${checkbox.value}"]`);
+    const raw = weightInput.value.trim();
+    const weight = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(weight) || weight < 1 || weight > 1000) {
+      setFieldError("event-distribution-error", "Selected event weights must be whole numbers from 1 to 1,000.");
+      valid = false;
+    } else distribution[checkbox.value] = weight;
+  }
+  return { valid, payload: {
+    name, description: description || null,
+    experiment_type: document.getElementById("experiment-type").value,
+    default_configuration: { tumbling_size: tumblingSize, sliding_size: slidingSize, sliding_interval: slidingInterval },
+    default_workload_configuration: { target_event_count: target, publish_interval_ms: publishInterval, event_type_distribution: distribution },
+  } };
+}
+
+document.getElementById("experiments-retry").addEventListener("click", () => { void loadExperiments(); });
+document.getElementById("default-sliding-size").addEventListener("change", syncSlidingIntervalOptions);
+syncSlidingIntervalOptions();
+
+document.getElementById("experiment-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const message = document.getElementById("experiment-form-message");
+  message.hidden = true;
+  message.className = "form-submit-message";
+  const { valid, payload } = validateExperimentForm();
+  if (!valid) {
+    message.textContent = "Check the highlighted fields and try again.";
+    message.hidden = false;
+    document.querySelector(".field-error:not(:empty)")?.scrollIntoView({ block: "center", behavior: "smooth" });
+    return;
+  }
+
+  const submit = document.getElementById("create-experiment-submit");
+  submit.disabled = true;
+  submit.textContent = "Saving definition…";
+  try {
+    const response = await fetch("/api/experiments", {
+      method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(payload),
+    });
+    let body;
+    try { body = await response.json(); } catch { body = null; }
+    if (!response.ok) throw new Error(validationMessage(body));
+    if (!body?.experiment_id) throw new Error("The API did not confirm the saved experiment definition.");
+    window.history.pushState({}, "", "/experiments?created=1");
+    renderRoute();
+    window.scrollTo({ top: 0, behavior: "auto" });
+  } catch (error) {
+    message.textContent = error.message || "Could not save the experiment. Your entries are still here; try again.";
+    message.hidden = false;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "Create Experiment";
+  }
+});
+
+function renderRoute() {
+  const activeRoute = normalizedRoute();
+  document.querySelectorAll("[data-route-view]").forEach((view) => {
+    view.hidden = view.dataset.routeView !== activeRoute;
+  });
+  document.querySelectorAll("[data-route-link]").forEach((link) => {
+    const linkRoute = normalizedRoute(new URL(link.href, window.location.href).pathname);
+    if (linkRoute === activeRoute || ((activeRoute === "create" || activeRoute === "details" || activeRoute === "run" || activeRoute === "results") && linkRoute === "experiments")) {
+      link.setAttribute("aria-current", "page");
+    } else {
+      link.removeAttribute("aria-current");
+    }
+  });
+  document.title = activeRoute === "dashboard" ? "StreamPulse — Library Analytics"
+    : activeRoute === "create" ? "StreamPulse — Create Experiment"
+      : activeRoute === "details" ? "StreamPulse — Experiment Details"
+        : activeRoute === "run" ? "StreamPulse — Live Experiment Run"
+          : activeRoute === "results" ? "StreamPulse — Run Results"
+            : activeRoute === "failureRecovery" ? "StreamPulse — Failure & Recovery" : "StreamPulse — Experiments";
+  document.getElementById("experiment-created-message").hidden = !(activeRoute === "experiments" && new URLSearchParams(window.location.search).has("created"));
+  if (activeRoute !== "dashboard") window.clearTimeout(refreshTimer);
+  else void refreshLiveData().finally(scheduleRefresh);
+  if (activeRoute === "experiments") void loadExperiments();
+  if (activeRoute === "details") void loadExperimentDetail();
+  if (activeRoute === "run") {
+    const { experimentId, runId } = runRouteIds();
+    if (runPageSnapshot && (runPageSnapshot.run.run_id !== runId || runPageSnapshot.run.experiment_id !== experimentId)) {
+      runPageSnapshot = null;
+      document.getElementById("run-page-content").hidden = true;
+      document.getElementById("run-page-loading").hidden = false;
+      document.getElementById("run-last-updated").textContent = "";
+    }
+    void refreshRunPage();
+  }
+  if (activeRoute === "results") {
+    const { experimentId, runId } = runRouteIds();
+    if (resultsPageSnapshot && (resultsPageSnapshot.run.run_id !== runId || resultsPageSnapshot.run.experiment_id !== experimentId)) {
+      resultsPageSnapshot = null;
+      document.getElementById("results-page-content").hidden = true;
+      document.getElementById("results-page-loading").hidden = false;
+      document.getElementById("results-last-updated").textContent = "";
+    }
+    void refreshResultsPage();
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const link = event.target.closest("a[data-route-link]");
+  if (!link || event.defaultPrevented || event.button !== 0
+      || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+
+  const destination = new URL(link.href, window.location.href);
+  const detailPath = /^\/experiments\/[0-9a-fA-F-]{36}$/.test(destination.pathname);
+  const runPath = /^\/experiments\/[0-9a-fA-F-]{36}\/runs\/[0-9a-fA-F-]{36}$/.test(destination.pathname);
+  const resultsPath = /^\/experiments\/[0-9a-fA-F-]{36}\/runs\/[0-9a-fA-F-]{36}\/results$/.test(destination.pathname);
+  if (destination.origin !== window.location.origin
+      || (!detailPath && !runPath && !resultsPath && !["/", "/experiments", "/experiments/new", "/failure-recovery"].includes(destination.pathname.replace(/\/+$/, "") || "/"))) return;
+
+  event.preventDefault();
+  const currentPath = window.location.pathname.replace(/\/+$/, "") || "/";
+  const nextPath = `${destination.pathname.replace(/\/+$/, "") || "/"}${destination.search}${destination.hash}`;
+  if (`${currentPath}${window.location.search}${window.location.hash}` !== nextPath) {
+    window.history.pushState({}, "", nextPath);
+  }
+  renderRoute();
+  window.scrollTo({ top: 0, behavior: "auto" });
+});
+
+window.addEventListener("popstate", renderRoute);
+renderRoute();

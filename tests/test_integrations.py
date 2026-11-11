@@ -1,8 +1,11 @@
 import asyncio
 import json
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import pytest
+from aiormq import spec as aiormq_spec
+from aiormq.exceptions import DeliveryError, PublishError
 from fastapi.testclient import TestClient
 
 import run_consumer
@@ -24,7 +27,7 @@ from app.storage.redis_metrics import (
 from app.processing.window_config import WindowConfiguration
 
 
-def make_event(value=1, event_id="event-1"):
+def make_event(value=1, event_id="event-1", run_id=None):
     return LibraryEvent(
         event_id=event_id,
         event_type="BOOK_ISSUED",
@@ -32,18 +35,27 @@ def make_event(value=1, event_id="event-1"):
         book_id="book-1",
         timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
         value=value,
+        run_id=run_id,
     )
 
 
+_DEFAULT_CONFIRMATION = object()
+
+
 class FakeExchange:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, result=_DEFAULT_CONFIRMATION):
         self.calls = []
         self.fail = fail
+        self.result = (
+            aiormq_spec.Basic.Ack(delivery_tag=1, multiple=False)
+            if result is _DEFAULT_CONFIRMATION else result
+        )
 
-    async def publish(self, message, routing_key):
+    async def publish(self, message, routing_key, **kwargs):
         if self.fail:
-            raise RuntimeError("fake transport failure")
+            raise self.fail if isinstance(self.fail, BaseException) else RuntimeError("fake transport failure")
         self.calls.append((message, routing_key))
+        return self.result
 
 
 class FakeChannel:
@@ -52,6 +64,8 @@ class FakeChannel:
         self.declared = []
         self.qos = []
         self.queue = queue or FakeQueue()
+        self.closed = False
+        self.order = None
 
     async def declare_queue(self, name, **kwargs):
         self.declared.append((name, kwargs))
@@ -60,6 +74,11 @@ class FakeChannel:
     async def set_qos(self, **kwargs):
         self.qos.append(kwargs)
 
+    async def close(self):
+        if self.order is not None:
+            self.order.append("channel_close")
+        self.closed = True
+
 
 class FakeQueue:
     def __init__(self, *, message_count=4, consumer_count=1, declare_fail=False):
@@ -67,6 +86,9 @@ class FakeQueue:
         self.consumer_count = consumer_count
         self.declare_fail = declare_fail
         self.declare_calls = 0
+        self.cancel_calls = []
+        self.cancel_timeouts = []
+        self.cancelled = None
 
     async def declare(self):
         self.declare_calls += 1
@@ -78,16 +100,31 @@ class FakeQueue:
         self.callback = callback
         return "fake-tag"
 
+    async def cancel(self, consumer_tag, timeout=None):
+        self.cancel_calls.append(consumer_tag)
+        self.cancel_timeouts.append(timeout)
+        if self.cancelled is not None:
+            self.cancelled.set()
+
 
 class FakeConnection:
     def __init__(self, channel):
         self._channel = channel
         self.closed = False
+        self.transport_closed = False
+        self.close_ack_received = False
+        self.order = None
 
-    async def channel(self):
+    async def channel(self, **kwargs):
         return self._channel
 
     async def close(self):
+        if self.order is not None:
+            self.order.append("connection_close")
+        # Model aio-pika's connection close: tear down its transport without
+        # waiting for a broker Connection.CloseOk response.
+        self.transport_closed = True
+        self._channel.closed = True
         self.closed = True
 
 
@@ -115,8 +152,98 @@ async def test_publisher_sends_valid_event_to_configured_queue():
 
 
 @pytest.mark.asyncio
+async def test_publisher_explicitly_enables_confirms_and_mandatory_returns():
+    channel = FakeChannel()
+
+    class ConfirmingConnection(FakeConnection):
+        async def channel(self, **kwargs):
+            assert kwargs == {"publisher_confirms": True, "on_return_raises": True}
+            return self._channel
+
+    publisher = RabbitMQPublisher(
+        RabbitMQSettings("amqps://fake-host", "events"),
+        connect=lambda url: asyncio.sleep(0, result=ConfirmingConnection(channel)),
+    )
+    await publisher.publish(make_event())
+
+
+@pytest.mark.asyncio
+async def test_publisher_classifies_nack_and_unroutable_as_definitive():
+    from app.messaging.rabbitmq import RabbitMQPublishError
+
+    nack = DeliveryError(None, aiormq_spec.Basic.Nack(delivery_tag=1, multiple=False, requeue=False))
+    returned = aiormq_spec.Basic.Return(
+        reply_code=312, reply_text="NO_ROUTE", exchange="", routing_key="events"
+    )
+    for error in (nack, PublishError(type("Returned", (), {"delivery": returned})(), returned)):
+        channel = FakeChannel(FakeExchange(fail=error))
+        publisher = RabbitMQPublisher(
+            RabbitMQSettings("amqps://fake-host", "events"),
+            connect=lambda url: asyncio.sleep(0, result=FakeConnection(channel)),
+        )
+        with pytest.raises(RabbitMQPublishError) as caught:
+            await publisher.publish(make_event())
+        assert caught.value.ambiguous is False
+
+
+@pytest.mark.asyncio
+async def test_publisher_classifies_post_invocation_timeout_and_unexpected_result_as_ambiguous():
+    from app.messaging.rabbitmq import RabbitMQPublishError
+
+    for exchange in (
+        FakeExchange(fail=TimeoutError()),
+        FakeExchange(fail=ConnectionError("connection lost after send")),
+        FakeExchange(result=None),
+    ):
+        publisher = RabbitMQPublisher(
+            RabbitMQSettings("amqps://fake-host", "events"),
+            connect=lambda url: asyncio.sleep(0, result=FakeConnection(FakeChannel(exchange))),
+        )
+        with pytest.raises(RabbitMQPublishError) as caught:
+            await publisher.publish(make_event())
+        assert caught.value.ambiguous is True
+
+
+@pytest.mark.asyncio
+async def test_publisher_classifies_connection_setup_failure_as_definitive():
+    from app.messaging.rabbitmq import RabbitMQPublishError
+
+    async def connect(url):
+        raise ConnectionError("could not connect")
+
+    publisher = RabbitMQPublisher(RabbitMQSettings("amqps://fake-host"), connect=connect)
+    with pytest.raises(RabbitMQPublishError) as caught:
+        await publisher.publish(make_event())
+    assert caught.value.ambiguous is False
+
+
+@pytest.mark.asyncio
 async def test_publisher_inspects_queue_counts_using_existing_connection():
     queue = FakeQueue(message_count=7, consumer_count=2)
+    channel = FakeChannel(queue=queue)
+    publisher_connection = FakeConnection(FakeChannel())
+    monitoring_connection = FakeConnection(channel)
+    connect_calls = []
+
+    async def connect(url):
+        connect_calls.append(url)
+        return publisher_connection if len(connect_calls) == 1 else monitoring_connection
+
+    publisher = RabbitMQPublisher(RabbitMQSettings("amqps://fake-host", "events"), connect=connect)
+    await publisher.publish(make_event())
+    counts = await publisher.inspect_queue()
+
+    assert counts == {"messages_ready": 7, "consumer_count": 2}
+    assert queue.declare_calls == 1
+    assert len(connect_calls) == 2
+    assert publisher_connection.closed is False
+    assert monitoring_connection.closed is True
+    assert channel.closed is True
+
+
+@pytest.mark.asyncio
+async def test_publisher_inspection_connects_and_verifies_queue_when_not_yet_publishing():
+    queue = FakeQueue(message_count=2, consumer_count=1)
     channel = FakeChannel(queue=queue)
     connection = FakeConnection(channel)
     connect_calls = []
@@ -126,17 +253,20 @@ async def test_publisher_inspects_queue_counts_using_existing_connection():
         return connection
 
     publisher = RabbitMQPublisher(RabbitMQSettings("amqps://fake-host", "events"), connect=connect)
-    await publisher.publish(make_event())
     counts = await publisher.inspect_queue()
 
-    assert counts == {"messages_ready": 7, "consumer_count": 2}
+    assert counts == {"messages_ready": 2, "consumer_count": 1}
+    assert connect_calls == ["amqps://fake-host"]
+    assert channel.declared == [(
+        "events", {"durable": True, "arguments": {"x-single-active-consumer": True}}
+    )]
     assert queue.declare_calls == 1
-    assert len(connect_calls) == 1
-    assert connection.closed is False
+    assert connection.closed is True
+    assert channel.closed is True
 
 
 @pytest.mark.asyncio
-async def test_publisher_queue_inspection_failure_is_sanitized():
+async def test_publisher_queue_inspection_failure_logs_reason_without_credentials(caplog):
     queue = FakeQueue(declare_fail=True)
     channel = FakeChannel(queue=queue)
 
@@ -150,6 +280,8 @@ async def test_publisher_queue_inspection_failure_is_sanitized():
         await publisher.inspect_queue()
     assert str(error.value) == "Could not inspect RabbitMQ queue"
     assert "secret" not in str(error.value)
+    assert "fake queue inspection failure" in caplog.text
+    assert "secret" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -163,7 +295,7 @@ async def test_publisher_wraps_transport_error_without_exposing_details():
     with pytest.raises(RabbitMQError) as error:
         await publisher.publish(make_event())
     assert "secret" not in str(error.value)
-    assert "Could not publish" in str(error.value)
+    assert "publish unknown" in str(error.value)
 
 
 class FakeMessage:
@@ -439,6 +571,34 @@ async def test_redis_metrics_store_round_trip_and_keys():
     assert await store.get_metrics("tumbling") is None
     assert store.key_for("tumbling") == "streampulse:metrics:tumbling"
     assert store.key_for("sliding") == "streampulse:metrics:sliding"
+
+
+@pytest.mark.asyncio
+async def test_run_summary_keys_are_isolated_from_global_and_other_runs():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    run_a, run_b = str(uuid4()), str(uuid4())
+    global_metrics = Metrics(1, 2.0, 2.0, 2.0, 2.0)
+    metrics_a = Metrics(2, 7.0, 3.5, 3.0, 4.0)
+    metrics_b = Metrics(3, 18.0, 6.0, 5.0, 7.0)
+
+    await store.save_metrics("sliding", global_metrics)
+    await store.save_run_metrics(run_a, "sliding", metrics_a)
+    await store.save_run_metrics(run_b, "sliding", metrics_b)
+
+    assert store.key_for("sliding") == "streampulse:metrics:sliding"
+    assert store.run_key_for("sliding", run_a) == (
+        f"streampulse:experiments:runs:{run_a}:metrics:sliding"
+    )
+    assert await store.get_metrics("sliding") == global_metrics
+    assert await store.get_run_metrics(run_a, "sliding") == metrics_a
+    assert await store.get_run_metrics(run_b, "sliding") == metrics_b
+    assert await store.get_run_metrics(run_a, "tumbling") is None
+    assert client.expirations == {}
+    with pytest.raises(ValueError, match="run_id must be a valid UUID"):
+        store.run_key_for("sliding", "not-a-uuid")
+    with pytest.raises(ValueError, match="run_id must be a valid UUID"):
+        await store.get_run_metrics("not-a-uuid", "sliding")
 
 
 @pytest.mark.asyncio
@@ -944,6 +1104,321 @@ async def test_shutdown_monitoring_failure_does_not_prevent_resource_cleanup(mon
 
 
 @pytest.mark.asyncio
+async def test_consumer_handler_count_releases_on_success_failure_and_cancellation():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingProcessor:
+        async def process(self, event):
+            started.set()
+            await release.wait()
+            return {}
+
+    consumer = RabbitMQConsumer(
+        BlockingProcessor(), RabbitMQSettings("amqp://fake", "events"),
+    )
+    message = FakeMessage(json.dumps({
+        "event_id": "tracked", "event_type": "BOOK_ISSUED", "student_id": "s",
+        "book_id": "b", "timestamp": "2026-01-01T00:00:00Z",
+    }).encode())
+    task = asyncio.create_task(consumer.handle_message(message))
+    await started.wait()
+    assert consumer.active_handler_count == 1
+    release.set()
+    await task
+    assert consumer.active_handler_count == 0
+    assert message.acks == 1
+
+    failed_consumer = RabbitMQConsumer(
+        FakeProcessor(fail=True), RabbitMQSettings("amqp://fake", "events"),
+    )
+    failed_message = FakeMessage(message.body)
+    await failed_consumer.handle_message(failed_message)
+    assert failed_consumer.active_handler_count == 0
+    assert failed_message.rejects == [False]
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled_consumer = RabbitMQConsumer(
+        BlockingProcessor(), RabbitMQSettings("amqp://fake", "events"),
+    )
+    cancelled_message = FakeMessage(message.body)
+    cancelled_task = asyncio.create_task(cancelled_consumer.handle_message(cancelled_message))
+    await started.wait()
+    assert cancelled_consumer.active_handler_count == 1
+    cancelled_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_task
+    assert cancelled_consumer.active_handler_count == 0
+    assert cancelled_message.acks == 0
+
+
+@pytest.mark.asyncio
+async def test_consumer_drain_cancels_subscription_then_waits_for_ack(tmp_path):
+    import json
+
+    from app.messaging.rabbitmq import ConsumerDrainResult
+
+    order = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingProcessor:
+        async def process(self, event):
+            order.append("process")
+            started.set()
+            await release.wait()
+            return {}
+
+    queue = FakeQueue()
+    queue.cancelled = asyncio.Event()
+    queue.order = order
+    original_cancel = queue.cancel
+
+    async def cancel(tag, timeout=None):
+        order.append("cancel_subscription")
+        await original_cancel(tag, timeout=timeout)
+
+    queue.cancel = cancel
+    channel = FakeChannel(queue=queue)
+    channel.order = order
+    connection = FakeConnection(channel)
+    connection.order = order
+    consumer = RabbitMQConsumer(
+        BlockingProcessor(), RabbitMQSettings("amqp://fake", "events"),
+        connect=lambda _url: asyncio.sleep(0, result=connection),
+        drain_timeout_seconds=1,
+    )
+    await consumer.start()
+
+    class OrderedMessage(FakeMessage):
+        async def ack(self):
+            order.append("ack")
+            await super().ack()
+
+    message = OrderedMessage(json.dumps({
+        "event_id": "drain", "event_type": "BOOK_RETURNED", "student_id": "s",
+        "book_id": "b", "timestamp": "2026-01-01T00:00:00Z",
+    }).encode())
+    handler = asyncio.create_task(queue.callback(message))
+    await started.wait()
+    drain_task = asyncio.create_task(consumer.drain())
+    await queue.cancelled.wait()
+    assert channel.closed is False
+    assert consumer.active_handler_count == 1
+    assert order[:2] == ["process", "cancel_subscription"]
+
+    release.set()
+    await handler
+    result = await drain_task
+
+    assert result == ConsumerDrainResult(True, False, 0)
+    assert order.index("ack") < order.index("channel_close") < order.index("connection_close")
+    assert queue.cancel_calls == ["fake-tag"]
+    assert message.acks == 1
+    assert consumer.active_handler_count == 0
+    assert await consumer.close() == result
+
+
+@pytest.mark.asyncio
+async def test_consumer_drain_timeout_closes_channel_without_ack_and_is_idempotent():
+    import json
+
+    started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    class BlockingProcessor:
+        async def process(self, event):
+            started.set()
+            await never_release.wait()
+
+    queue = FakeQueue()
+    channel = FakeChannel(queue=queue)
+    connection = FakeConnection(channel)
+    consumer = RabbitMQConsumer(
+        BlockingProcessor(), RabbitMQSettings("amqp://fake", "events"),
+        connect=lambda _url: asyncio.sleep(0, result=connection),
+        drain_timeout_seconds=0.01,
+    )
+    await consumer.start()
+    message = FakeMessage(json.dumps({
+        "event_id": "timeout", "event_type": "BOOK_RESERVED", "student_id": "s",
+        "book_id": "b", "timestamp": "2026-01-01T00:00:00Z",
+    }).encode())
+    handler = asyncio.create_task(queue.callback(message))
+    await started.wait()
+
+    result = await consumer.close()
+    with pytest.raises(asyncio.CancelledError):
+        await handler
+
+    assert result.completed is False
+    assert result.timed_out is True
+    assert result.subscription_cancelled is True
+    assert result.handlers_drained is False
+    assert result.active_handlers_remaining == 0
+    assert channel.closed and connection.closed
+    assert message.acks == 0
+    assert message.rejects == []
+    assert queue.cancel_calls == ["fake-tag"]
+    assert await consumer.drain() == result
+
+
+@pytest.mark.asyncio
+async def test_subscription_cancel_timeout_is_bounded_and_closes_transport():
+    import json
+
+    cancel_started = asyncio.Event()
+    never_cancel_complete = asyncio.Event()
+    handler_started = asyncio.Event()
+    never_finish_handler = asyncio.Event()
+
+    class BlockingProcessor:
+        async def process(self, event):
+            handler_started.set()
+            await never_finish_handler.wait()
+
+    queue = FakeQueue()
+
+    async def cancel_without_cancel_ok(tag, timeout=None):
+        queue.cancel_calls.append(tag)
+        queue.cancel_timeouts.append(timeout)
+        cancel_started.set()
+        await never_cancel_complete.wait()
+
+    queue.cancel = cancel_without_cancel_ok
+    channel = FakeChannel(queue=queue)
+    channel_close_started = asyncio.Event()
+
+    async def channel_close_without_close_ok():
+        channel_close_started.set()
+        await asyncio.Future()
+
+    channel.close = channel_close_without_close_ok
+    connection = FakeConnection(channel)
+    consumer = RabbitMQConsumer(
+        BlockingProcessor(), RabbitMQSettings("amqp://fake", "events"),
+        connect=lambda _url: asyncio.sleep(0, result=connection),
+        drain_timeout_seconds=0.05,
+    )
+    await consumer.start()
+    message = FakeMessage(json.dumps({
+        "event_id": "cancel-timeout", "event_type": "BOOK_RESERVED", "student_id": "s",
+        "book_id": "b", "timestamp": "2026-01-01T00:00:00Z",
+    }).encode())
+    handler = asyncio.create_task(queue.callback(message))
+    await handler_started.wait()
+
+    async with asyncio.timeout(1):
+        result = await consumer.close()
+    with pytest.raises(asyncio.CancelledError):
+        await handler
+
+    assert cancel_started.is_set()
+    assert 0 < queue.cancel_timeouts[0] <= consumer.drain_timeout_seconds
+    assert result.completed is False
+    assert result.timed_out is True
+    assert result.subscription_cancelled is False
+    assert result.handlers_drained is False
+    assert result.active_handlers_remaining == 0
+    assert not channel_close_started.is_set()
+    assert connection.closed and connection.transport_closed
+    assert connection.close_ack_received is False
+    assert message.acks == 0
+    assert message.rejects == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_subscription_uses_shared_deadline_for_handler_drain():
+    import json
+
+    loop = asyncio.get_running_loop()
+    cancel_started = asyncio.Event()
+    allow_cancel_ok = asyncio.Event()
+    handler_started = asyncio.Event()
+    handler_release = asyncio.Event()
+
+    class BlockingProcessor:
+        async def process(self, event):
+            handler_started.set()
+            await handler_release.wait()
+            return {}
+
+    queue = FakeQueue()
+
+    async def delayed_cancel_ok(tag, timeout=None):
+        queue.cancel_calls.append(tag)
+        queue.cancel_timeouts.append(timeout)
+        cancel_started.set()
+        await allow_cancel_ok.wait()
+
+    queue.cancel = delayed_cancel_ok
+    channel = FakeChannel(queue=queue)
+    connection = FakeConnection(channel)
+    consumer = RabbitMQConsumer(
+        BlockingProcessor(), RabbitMQSettings("amqp://fake", "events"),
+        connect=lambda _url: asyncio.sleep(0, result=connection),
+        drain_timeout_seconds=0.5,
+    )
+    await consumer.start()
+    message = FakeMessage(json.dumps({
+        "event_id": "shared-deadline", "event_type": "BOOK_ISSUED", "student_id": "s",
+        "book_id": "b", "timestamp": "2026-01-01T00:00:00Z",
+    }).encode())
+    handler = asyncio.create_task(queue.callback(message))
+    await handler_started.wait()
+
+    drain_task = asyncio.create_task(consumer.drain())
+    await cancel_started.wait()
+    loop.call_later(0.05, allow_cancel_ok.set)
+    loop.call_later(0.2, handler_release.set)
+    result = await drain_task
+    await handler
+
+    assert result.completed is True
+    assert result.timed_out is False
+    assert result.subscription_cancelled is True
+    assert result.handlers_drained is True
+    assert queue.cancel_timeouts[0] <= consumer.drain_timeout_seconds
+    assert message.acks == 1
+    assert channel.closed and connection.closed
+
+
+@pytest.mark.asyncio
+async def test_delivery_dispatched_during_subscription_cancel_is_requeued_without_processing():
+    import json
+
+    processor = FakeProcessor()
+    queue = FakeQueue()
+    late_message = FakeMessage(json.dumps({
+        "event_id": "late", "event_type": "BOOK_ISSUED", "student_id": "s",
+        "book_id": "b", "timestamp": "2026-01-01T00:00:00Z",
+    }).encode())
+    channel = FakeChannel(queue=queue)
+    connection = FakeConnection(channel)
+    consumer = RabbitMQConsumer(
+        processor, RabbitMQSettings("amqp://fake", "events"),
+        connect=lambda _url: asyncio.sleep(0, result=connection),
+    )
+    await consumer.start()
+    original_cancel = queue.cancel
+
+    async def cancel_with_inflight_delivery(tag, timeout=None):
+        await original_cancel(tag, timeout=timeout)
+        queue.late_task = asyncio.create_task(queue.callback(late_message))
+
+    queue.cancel = cancel_with_inflight_delivery
+    result = await consumer.drain()
+    await queue.late_task
+
+    assert result.completed is True
+    assert processor.events == []
+    assert late_message.acks == 0
+    assert late_message.rejects == [True]
+    assert consumer.active_handler_count == 0
+
+
+@pytest.mark.asyncio
 async def test_processor_preserves_tumbling_and_sliding_semantics():
     store = RecordingStore()
     processor = LibraryEventProcessor(TumblingWindow(2), SlidingWindow(2), store)
@@ -956,6 +1431,82 @@ async def test_processor_preserves_tumbling_and_sliding_semantics():
     assert [name for name, _ in store.saved] == ["sliding", "tumbling", "sliding"]
     assert second["tumbling"] == Metrics(2, 6.0, 3.0, 2.0, 4.0)
     assert second["sliding"] == Metrics(2, 6.0, 3.0, 2.0, 4.0)
+
+
+@pytest.mark.asyncio
+async def test_run_processor_uses_immutable_snapshot_and_ignores_global_pending_configuration():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    dashboard_active = WindowConfiguration(5, 5, 1)
+    dashboard_pending = WindowConfiguration(5, 5, 2)
+    snapshot = WindowConfiguration(8, 10, 2)
+    run_id = str(uuid4())
+    await store.initialize_active_configuration(dashboard_active)
+    await store.save_pending_configuration(dashboard_pending)
+    processor = LibraryEventProcessor(
+        TumblingWindow(snapshot.tumbling_size),
+        SlidingWindow(snapshot.sliding_size, snapshot.sliding_interval),
+        store,
+        snapshot,
+        run_id=run_id,
+    )
+
+    for value in range(1, 9):
+        await processor.process(make_event(value, f"run-{value}", run_id=run_id))
+
+    assert processor.active_configuration == snapshot
+    assert processor.tumbling.size == 8 and processor.tumbling.pending_count == 0
+    assert processor.sliding.size == 10 and processor.sliding.interval == 2
+    assert await store.read_active_configuration() == dashboard_active
+    assert await store.read_pending_configuration() == dashboard_pending
+    assert await store.get_run_metrics(run_id, "tumbling") == Metrics(8, 36.0, 4.5, 1.0, 8.0)
+    assert await store.get_run_metrics(run_id, "sliding") == Metrics(8, 36.0, 4.5, 1.0, 8.0)
+    assert await store.get_metrics("tumbling") is None
+    assert await store.get_metrics("sliding") is None
+
+
+@pytest.mark.asyncio
+async def test_distinct_run_processors_write_only_to_their_own_summary_namespaces():
+    client = FakeRedis()
+    store = RedisMetricsStore(client=client)
+    processors = {}
+    for run_id in (str(uuid4()), str(uuid4())):
+        configuration = WindowConfiguration(5, 5, 1)
+        processors[run_id] = LibraryEventProcessor(
+            TumblingWindow(configuration.tumbling_size),
+            SlidingWindow(configuration.sliding_size, configuration.sliding_interval),
+            store,
+            configuration,
+            run_id=run_id,
+        )
+
+    run_a, run_b = tuple(processors)
+    for value in range(1, 6):
+        await processors[run_a].process(make_event(value, f"a-{value}", run_id=run_a))
+        await processors[run_b].process(make_event(value + 10, f"b-{value}", run_id=run_b))
+
+    assert await store.get_run_metrics(run_a, "tumbling") == Metrics(5, 15.0, 3.0, 1.0, 5.0)
+    assert await store.get_run_metrics(run_b, "tumbling") == Metrics(5, 65.0, 13.0, 11.0, 15.0)
+    assert await store.get_run_metrics(run_a, "sliding") != await store.get_run_metrics(run_b, "sliding")
+    assert await store.get_metrics("tumbling") is None
+    assert await store.get_metrics("sliding") is None
+
+
+def test_run_processor_validates_uuid_configuration_and_window_match():
+    store = RecordingStore()
+    configuration = WindowConfiguration(5, 5, 1)
+    with pytest.raises(ValueError, match="valid UUID"):
+        LibraryEventProcessor(
+            TumblingWindow(5), SlidingWindow(5), store, configuration, run_id="invalid"
+        )
+    with pytest.raises(ValueError, match="require an immutable"):
+        LibraryEventProcessor(
+            TumblingWindow(5), SlidingWindow(5), store, run_id=str(uuid4())
+        )
+    with pytest.raises(ValueError, match="must match its configuration"):
+        LibraryEventProcessor(
+            TumblingWindow(8), SlidingWindow(5), store, configuration, run_id=str(uuid4())
+        )
 
 
 @pytest.mark.asyncio

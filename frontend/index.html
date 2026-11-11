@@ -8,18 +8,23 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=architecture-status-1">
+  <link rel="stylesheet" href="/static/styles.css?v=phase4-failure-analysis-1">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#top" aria-label="StreamPulse home">
+    <a class="brand" href="/" data-route-link aria-label="StreamPulse Dashboard">
       <span class="brand-mark" aria-hidden="true">
         <svg viewBox="0 0 32 32" fill="none"><path d="M4 17h5l3-8 6 15 4-10 2 3h4" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </span>
       <span class="brand-name">Stream<span>Pulse</span></span>
     </a>
+    <nav class="primary-navigation" aria-label="Primary navigation">
+      <a class="primary-navigation-link" href="/" data-route-link aria-current="page">Dashboard</a>
+      <a class="primary-navigation-link" href="/experiments" data-route-link>Experiments</a>
+      <a class="primary-navigation-link" href="/failure-recovery" data-route-link>Failure &amp; Recovery</a>
+    </nav>
     <div class="topbar-right">
-      <div class="refresh-note"><span class="pulse-dot" aria-hidden="true"></span> Refreshes every 10 seconds</div>
+      <div class="refresh-note"><span class="pulse-dot" aria-hidden="true"></span> Dashboard refreshes every 10 seconds</div>
       <div class="service-status" aria-label="Service status">
         <span id="api-status" class="status-pill status-checking"><span class="status-dot"></span><span>API checking</span></span>
         <span id="rabbit-status" class="service-label">RabbitMQ <b>Checking</b></span>
@@ -29,6 +34,7 @@
   </header>
 
   <main id="top" class="page-shell">
+    <div id="dashboard-view" class="route-view" data-route-view="dashboard">
     <section class="intro-row">
       <div>
         <p class="eyebrow">LIBRARY OPERATIONS · REAL-TIME ANALYTICS</p>
@@ -164,7 +170,7 @@
       <div class="section-title-row chart-heading-row">
         <div>
           <p class="eyebrow">SYSTEM OVERVIEW</p>
-          <h2 id="architecture-title">System Architecture Simulation</h2>
+          <h2 id="architecture-title">System Architecture</h2>
           <p class="panel-copy">Explore the existing event path and the status information currently available to this dashboard.</p>
         </div>
       </div>
@@ -251,9 +257,480 @@
     </section>
 
     <footer class="page-footer"><span>StreamPulse · Real-Time Library Analytics</span><span>Window counts show current window contents</span></footer>
+    </div>
+    <section id="experiments-view" class="route-view experiments-page" data-route-view="experiments" aria-labelledby="experiments-title" hidden>
+      <div class="experiments-heading-row">
+        <div>
+          <p class="eyebrow">PERFORMANCE LAB</p>
+          <h1 id="experiments-title">Experiments</h1>
+          <p class="intro-copy">Define controlled workloads and keep experiment configurations organized for repeatable performance analysis.</p>
+        </div>
+        <a id="experiments-header-create" class="primary-action-button" href="/experiments/new" data-route-link hidden>Create Experiment</a>
+      </div>
+
+      <div id="experiment-created-message" class="inline-message success experiment-notice" role="status" aria-live="polite" hidden>
+        Experiment definition saved.
+      </div>
+      <div id="experiments-loading" class="panel experiments-loading" role="status">Loading experiments…</div>
+      <section id="experiments-error" class="panel experiments-feedback error" aria-labelledby="experiments-error-title" hidden>
+        <h2 id="experiments-error-title">Experiments are unavailable</h2>
+        <p id="experiments-error-detail">Could not load experiments.</p>
+        <button id="experiments-retry" class="secondary-action-button" type="button">Try again</button>
+      </section>
+
+      <section id="experiments-empty" class="panel experiments-empty" aria-labelledby="experiments-empty-title" hidden>
+        <p class="eyebrow">A CLEAN START</p>
+        <h2 id="experiments-empty-title">Create your first experiment</h2>
+        <p>Save a reusable experiment definition with the window and workload defaults you want to use later.</p>
+        <a class="primary-action-button" href="/experiments/new" data-route-link>Create Experiment</a>
+      </section>
+
+      <section id="experiments-results" class="experiments-results" aria-label="Experiment list" hidden>
+        <div class="experiment-summary-grid" aria-label="Experiment summary">
+          <article class="panel experiment-summary-card">
+            <p class="eyebrow">SAVED DEFINITIONS</p>
+            <strong id="experiments-total-count">—</strong>
+            <span>Total experiments</span>
+          </article>
+          <article class="panel experiment-summary-card">
+            <p class="eyebrow">METADATA</p>
+            <strong id="experiments-type-count">—</strong>
+            <span>Experiment types represented</span>
+          </article>
+        </div>
+        <div class="experiments-table-wrap">
+          <table class="experiments-table">
+            <thead>
+              <tr>
+                <th scope="col">Experiment</th>
+                <th scope="col">Type</th>
+                <th scope="col">Last updated</th>
+                <th scope="col">Window defaults</th>
+                <th scope="col">Workload defaults</th>
+                <th scope="col">Action</th>
+              </tr>
+            </thead>
+            <tbody id="experiments-table-body"></tbody>
+          </table>
+        </div>
+        <div id="experiments-cards" class="experiments-cards" aria-label="Experiments"></div>
+      </section>
+    </section>
+
+    <section id="experiment-details-view" class="route-view experiment-details-page" data-route-view="details" aria-labelledby="experiment-detail-title" hidden>
+      <div class="detail-page-heading">
+        <a class="back-link" href="/experiments" data-route-link>← Back to Experiments</a>
+        <p class="eyebrow">SAVED DEFINITION</p>
+        <h1 id="experiment-detail-title">Experiment details</h1>
+        <p id="experiment-detail-description" class="intro-copy"></p>
+      </div>
+      <div id="experiment-detail-loading" class="panel experiments-loading" role="status">Loading experiment…</div>
+      <section id="experiment-detail-error" class="panel experiments-feedback error" aria-labelledby="experiment-detail-error-title" hidden>
+        <h2 id="experiment-detail-error-title">Experiment could not be loaded</h2>
+        <p id="experiment-detail-error-message">Try again in a moment.</p>
+        <button id="experiment-detail-retry" class="secondary-action-button" type="button">Try again</button>
+      </section>
+      <section id="experiment-detail-missing" class="panel experiments-empty" aria-labelledby="experiment-detail-missing-title" hidden>
+        <h2 id="experiment-detail-missing-title">Experiment not found</h2>
+        <p>This experiment may have been removed, or the link may be incorrect.</p>
+        <a class="secondary-action-button" href="/experiments" data-route-link>Back to Experiments</a>
+      </section>
+      <div id="experiment-detail-content" hidden>
+        <section class="panel experiment-info-panel" aria-labelledby="experiment-info-heading">
+          <div class="detail-panel-heading"><div><p class="eyebrow">DEFINITION</p><h2 id="experiment-info-heading">Experiment information</h2></div><span id="experiment-detail-type" class="experiment-type-tag"></span></div>
+          <dl class="experiment-info-grid">
+            <dt>Experiment ID</dt><dd id="experiment-detail-id"></dd>
+            <dt>Created</dt><dd id="experiment-detail-created"></dd>
+            <dt>Description</dt><dd id="experiment-detail-description-value"></dd>
+          </dl>
+        </section>
+        <section class="panel experiment-info-panel" aria-labelledby="experiment-config-heading">
+          <div class="detail-panel-heading"><div><p class="eyebrow">SAVED DEFAULTS</p><h2 id="experiment-config-heading">Configuration</h2></div></div>
+          <dl class="experiment-config-grid">
+            <dt>Tumbling window size</dt><dd id="detail-tumbling-size"></dd>
+            <dt>Sliding window size</dt><dd id="detail-sliding-size"></dd>
+            <dt>Sliding interval</dt><dd id="detail-sliding-interval"></dd>
+            <dt>Target event count</dt><dd id="detail-target-count"></dd>
+            <dt>Publish interval</dt><dd id="detail-publish-interval"></dd>
+            <dt>Event distribution</dt><dd id="detail-event-distribution"></dd>
+          </dl>
+        </section>
+        <div id="experiment-detail-message" class="form-submit-message" role="status" aria-live="polite" hidden></div>
+        <div class="experiment-detail-actions">
+          <button id="experiment-edit-toggle" class="secondary-action-button" type="button">Edit Experiment</button>
+          <button id="experiment-create-run" class="primary-action-button" type="button">Create New Run</button>
+        </div>
+        <section id="experiment-edit-panel" class="panel experiment-form-section experiment-edit-panel" aria-labelledby="experiment-edit-heading" hidden>
+          <div class="form-section-heading"><span>✎</span><div><p class="eyebrow">UPDATE DEFINITION</p><h2 id="experiment-edit-heading">Edit Experiment</h2></div></div>
+          <form id="experiment-edit-form" class="experiment-form" novalidate>
+            <div class="experiment-form-grid">
+              <div class="form-field form-field-wide"><label for="edit-experiment-name">Experiment name</label><input id="edit-experiment-name" maxlength="160" required></div>
+              <div class="form-field form-field-wide"><label for="edit-experiment-description">Description</label><textarea id="edit-experiment-description" maxlength="2000" rows="3"></textarea></div>
+              <div class="form-field"><label for="edit-experiment-type">Experiment type</label><select id="edit-experiment-type"><option value="window_performance">Window performance</option><option value="window_configuration_comparison">Window configuration comparison</option><option value="throughput_benchmark">Throughput benchmark</option><option value="reliability_testing">Reliability testing</option></select><span class="field-help">Experiment type is metadata.</span></div>
+            </div>
+            <div class="experiment-form-grid three-columns detail-edit-numbers">
+              <div class="form-field"><label for="edit-tumbling-size">Tumbling window size</label><select id="edit-tumbling-size"><option value="5">5 events</option><option value="8">8 events</option><option value="10">10 events</option></select></div>
+              <div class="form-field"><label for="edit-sliding-size">Sliding window size</label><select id="edit-sliding-size"><option value="5">5 events</option><option value="8">8 events</option><option value="10">10 events</option></select></div>
+              <div class="form-field"><label for="edit-sliding-interval">Sliding interval</label><select id="edit-sliding-interval"></select></div>
+              <div class="form-field"><label for="edit-target-count">Target events</label><input id="edit-target-count" type="number" min="1" max="10000" step="1"></div>
+              <div class="form-field"><label for="edit-publish-interval">Publish interval (ms)</label><input id="edit-publish-interval" type="number" min="10" max="60000" step="1"></div>
+            </div>
+            <fieldset class="event-distribution-fieldset"><legend>Event distribution weights</legend><div class="event-weight-list">
+              <div class="event-weight-row"><label class="event-type-choice"><input type="checkbox" name="edit-event-type" value="BOOK_ISSUED"><span>Book issued</span></label><label class="weight-field">Weight<input type="number" min="1" max="1000" step="1" data-edit-event-weight="BOOK_ISSUED"></label></div>
+              <div class="event-weight-row"><label class="event-type-choice"><input type="checkbox" name="edit-event-type" value="BOOK_RETURNED"><span>Book returned</span></label><label class="weight-field">Weight<input type="number" min="1" max="1000" step="1" data-edit-event-weight="BOOK_RETURNED"></label></div>
+              <div class="event-weight-row"><label class="event-type-choice"><input type="checkbox" name="edit-event-type" value="BOOK_RESERVED"><span>Book reserved</span></label><label class="weight-field">Weight<input type="number" min="1" max="1000" step="1" data-edit-event-weight="BOOK_RESERVED"></label></div>
+            </div></fieldset>
+            <div id="experiment-edit-message" class="form-submit-message" role="alert" aria-live="polite" hidden></div>
+            <div class="experiment-form-actions"><button id="experiment-edit-cancel" class="secondary-action-button" type="button">Cancel</button><button id="experiment-edit-save" class="primary-action-button" type="submit">Save Changes</button></div>
+          </form>
+        </section>
+      </div>
+    </section>
+
+    <section id="experiment-run-view" class="route-view experiment-run-page" data-route-view="run" aria-labelledby="experiment-run-title" hidden>
+      <div class="run-page-heading">
+        <a id="run-back-to-experiment" class="back-link" href="/experiments" data-route-link>← Back to Experiment Details</a>
+        <div class="run-page-title-row"><div><p class="eyebrow">CONTROLLED EXECUTION</p><h1 id="experiment-run-title">Experiment Run</h1><p id="run-experiment-name" class="intro-copy"></p></div>
+          <div class="run-refresh-control"><button id="run-refresh-button" class="secondary-action-button" type="button">↻ Refresh</button><span id="run-refresh-indicator" class="field-help" role="status" aria-live="polite"></span><span id="run-last-updated" class="field-help"></span></div>
+        </div>
+      </div>
+      <div id="run-page-loading" class="panel experiments-loading" role="status">Loading run details…</div>
+      <section id="run-page-error" class="panel experiments-feedback error" aria-labelledby="run-page-error-title" hidden>
+        <h2 id="run-page-error-title">Run details are unavailable</h2><p id="run-page-error-message">Could not load this run.</p>
+        <button id="run-page-retry" class="secondary-action-button" type="button">Try again</button>
+      </section>
+      <section id="run-page-missing" class="panel experiments-empty" aria-labelledby="run-page-missing-title" hidden>
+        <h2 id="run-page-missing-title">Run not found</h2><p>This run may have been removed, or the link may be incorrect.</p>
+        <a id="run-missing-back-link" class="secondary-action-button" href="/experiments" data-route-link>Back to Experiments</a>
+      </section>
+      <div id="run-page-content" hidden>
+        <section class="panel run-section run-overview-section" aria-labelledby="run-overview-heading">
+          <div class="run-section-heading"><div><p class="eyebrow">01 · LIFECYCLE</p><h2 id="run-overview-heading">Run Overview</h2></div><span id="run-status-badge" class="run-status-badge"></span></div>
+          <p id="run-lifecycle-note" class="run-lifecycle-note" hidden></p>
+          <dl class="run-identity-grid">
+            <dt>Experiment</dt><dd id="run-experiment-title-value"></dd>
+            <dt>Experiment ID</dt><dd id="run-experiment-id"></dd>
+            <dt>Run ID</dt><dd id="run-run-id"></dd>
+            <dt>Created</dt><dd id="run-created-at"></dd>
+            <dt>Started</dt><dd id="run-started-at"></dd>
+          </dl>
+          <div class="run-controls"><div id="run-control-message" class="form-submit-message" role="status" aria-live="polite" hidden></div>
+            <div id="run-control-buttons" class="run-control-buttons"></div>
+          </div>
+        </section>
+
+        <section class="panel run-section" aria-labelledby="run-progress-heading">
+          <div class="run-section-heading"><div><p class="eyebrow">02 · WORKLOAD</p><h2 id="run-progress-heading">Execution Progress</h2></div></div>
+          <div id="run-progress-bar-wrap" class="run-progress-bar-wrap" hidden><div class="run-progress-label"><span>Generated workload</span><strong id="run-progress-fraction"></strong></div><progress id="run-progress-bar" max="100" value="0" aria-label="Generated workload progress"></progress></div>
+          <dl class="run-progress-grid">
+            <div><dt>Target events</dt><dd id="run-progress-target"></dd></div>
+            <div><dt>Generated events</dt><dd id="run-progress-generated"></dd></div>
+            <div><dt>Publish confirmed</dt><dd id="run-progress-published"></dd></div>
+            <div><dt>Publish failures</dt><dd id="run-progress-publish-failed"></dd></div>
+            <div><dt>Processed successfully</dt><dd id="run-progress-processed"></dd></div>
+            <div><dt>Processing failures</dt><dd id="run-progress-processing-failed"></dd></div>
+            <div><dt>Pending work</dt><dd id="run-progress-pending"></dd></div>
+          </dl>
+          <p id="run-progress-note" class="field-help run-data-note" hidden></p>
+        </section>
+
+        <section class="panel run-section" aria-labelledby="run-measurements-heading">
+          <div class="run-section-heading"><div><p class="eyebrow">03 · AGGREGATION & PERFORMANCE</p><h2 id="run-measurements-heading">Window Aggregation + Measurements</h2></div></div>
+          <p class="field-help">Run-scoped aggregation progress is unavailable through the existing APIs.</p>
+          <div class="run-window-grid">
+            <article class="run-subpanel"><h3>Tumbling Window</h3><p id="run-tumbling-window-value">Unavailable</p></article>
+            <article class="run-subpanel"><h3>Sliding Window</h3><p id="run-sliding-window-value">Unavailable</p></article>
+          </div>
+          <div class="run-metric-grid">
+            <article class="run-metric-card"><span>Measured throughput</span><strong id="run-throughput-value">Unavailable</strong><small>Run-scoped measurement</small></article>
+            <article class="run-metric-card"><span>Average processing latency</span><strong id="run-average-latency">Unavailable</strong><small>Consumer processing sample</small></article>
+            <article class="run-metric-card"><span>P95 processing latency</span><strong id="run-p95-latency">Unavailable</strong><small>Consumer processing sample</small></article>
+            <article class="run-metric-card"><span>Final benchmark throughput</span><strong id="run-final-throughput">Unavailable</strong><small>Available from finalized results</small></article>
+          </div>
+          <div class="run-completeness-row"><p id="run-result-completeness" class="run-completeness-badge">Result completeness: Unavailable</p><p id="run-latency-completeness" class="run-completeness-badge">Latency completeness: Unavailable</p></div>
+          <p id="run-measurements-note" class="field-help run-data-note"></p>
+        </section>
+
+        <section class="panel run-section" aria-labelledby="run-timeline-heading">
+          <div class="run-section-heading"><div><p class="eyebrow">04 · PERSISTED EVENTS</p><h2 id="run-timeline-heading">Execution Timeline</h2></div></div>
+          <ol id="run-timeline" class="run-timeline"></ol>
+          <p id="run-timeline-empty" class="field-help" hidden>No lifecycle timestamps have been recorded yet.</p>
+        </section>
+      </div>
+    </section>
+
+    <section id="experiment-results-view" class="route-view experiment-results-page" data-route-view="results" aria-labelledby="experiment-results-title" hidden>
+      <div class="results-page-heading">
+        <a id="results-back-to-run" class="back-link" href="/experiments" data-route-link>← Back to Run</a>
+        <p class="eyebrow">PERSISTED RUN RESULTS</p>
+        <h1 id="experiment-results-title">Run Results</h1>
+        <p id="results-experiment-name" class="intro-copy"></p>
+        <div class="results-refresh-row"><button id="results-refresh-button" class="secondary-action-button" type="button">↻ Refresh</button><span id="results-last-updated" class="field-help" role="status" aria-live="polite"></span></div>
+      </div>
+      <div id="results-page-loading" class="panel experiments-loading" role="status">Loading persisted run information…</div>
+      <section id="results-page-error" class="panel experiments-feedback error" aria-labelledby="results-page-error-title" hidden>
+        <h2 id="results-page-error-title">Results are unavailable</h2><p id="results-page-error-message">Could not load this run.</p>
+        <button id="results-page-retry" class="secondary-action-button" type="button">Try again</button>
+      </section>
+      <section id="results-page-missing" class="panel experiments-empty" aria-labelledby="results-page-missing-title" hidden>
+        <h2 id="results-page-missing-title">Run not found</h2><p>The requested run could not be found for this experiment.</p>
+        <a id="results-missing-back-to-experiment" class="secondary-action-button" href="/experiments" data-route-link>Back to Experiment Details</a>
+      </section>
+      <div id="results-page-content" hidden>
+        <section class="panel results-section" aria-labelledby="results-run-summary-heading">
+          <div class="results-section-heading"><div><p class="eyebrow">01 · RUN SUMMARY</p><h2 id="results-run-summary-heading">Run Summary</h2></div><span id="results-status" class="run-status-badge"></span></div>
+          <p id="results-provisional-note" class="results-provisional-note" hidden></p>
+          <dl class="results-identity-grid">
+            <dt>Experiment</dt><dd id="results-experiment-name-value"></dd>
+            <dt>Experiment ID</dt><dd id="results-experiment-id"></dd>
+            <dt>Run ID</dt><dd id="results-run-id"></dd>
+            <dt>Created</dt><dd id="results-created-at"></dd>
+            <dt>Started</dt><dd id="results-started-at"></dd>
+            <dt>Terminal timestamp</dt><dd id="results-ended-at"></dd>
+          </dl>
+          <div class="results-page-actions"><a id="results-back-to-detail" class="secondary-action-button" href="/experiments" data-route-link>Experiment Details</a></div>
+        </section>
+
+        <section class="panel results-section" aria-labelledby="results-execution-heading">
+          <div class="results-section-heading"><div><p class="eyebrow">02 · EVENT ACCOUNTING</p><h2 id="results-execution-heading">Execution Metrics</h2></div></div>
+          <div class="results-metric-grid">
+            <article class="run-metric-card"><span>Target events</span><strong id="results-target-events">Unavailable</strong></article>
+            <article class="run-metric-card"><span>Generated events</span><strong id="results-generated-events">Unavailable</strong></article>
+            <article class="run-metric-card"><span>Published confirmed</span><strong id="results-published-events">Unavailable</strong></article>
+            <article class="run-metric-card"><span>Processed successfully</span><strong id="results-processed-events">Unavailable</strong></article>
+            <article class="run-metric-card"><span>Publish failures</span><strong id="results-publish-failures">Unavailable</strong></article>
+            <article class="run-metric-card"><span>Processing failures</span><strong id="results-processing-failures">Unavailable</strong></article>
+            <article class="run-metric-card"><span>Pending events</span><strong id="results-pending-events">Unavailable</strong></article>
+          </div>
+          <p class="field-help results-help">Publish confirmation, consumer processing, and the two failure stages are shown separately.</p>
+        </section>
+
+        <section class="panel results-section" aria-labelledby="results-performance-heading">
+          <div class="results-section-heading"><div><p class="eyebrow">03 · PERFORMANCE</p><h2 id="results-performance-heading">Performance Measurements</h2></div></div>
+          <div class="results-completeness-row"><p id="results-result-complete" class="run-completeness-badge">Result completeness: Unavailable</p><p id="results-latency-complete" class="run-completeness-badge">Latency completeness: Unavailable</p></div>
+          <div class="results-metric-grid performance-results-grid">
+            <article class="run-metric-card"><span>Throughput</span><strong id="results-throughput">Unavailable</strong></article>
+            <article class="run-metric-card"><span>Average processing latency</span><strong id="results-average-latency">Unavailable</strong></article>
+            <article class="run-metric-card"><span>P95 processing latency</span><strong id="results-p95-latency">Unavailable</strong></article>
+          </div>
+          <p id="results-completeness-notes" class="field-help results-help"></p>
+        </section>
+
+        <section class="panel results-section" aria-labelledby="results-windows-heading">
+          <div class="results-section-heading"><div><p class="eyebrow">04 · WINDOW OUTPUT</p><h2 id="results-windows-heading">Window Results</h2></div></div>
+          <p class="field-help results-help">Run-scoped window output is unavailable because existing APIs do not expose these summaries.</p>
+          <div class="run-window-grid">
+            <article class="run-subpanel"><h3>Tumbling Window Results</h3><p>Unavailable</p></article>
+            <article class="run-subpanel"><h3>Sliding Window Results</h3><p>Unavailable</p></article>
+          </div>
+        </section>
+
+        <section class="panel results-section comparison-section" aria-labelledby="comparison-heading">
+          <div class="results-section-heading"><div><p class="eyebrow">05 · SAME EXPERIMENT</p><h2 id="comparison-heading">Compare Runs</h2></div></div>
+          <p class="comparison-intro">Choose at least two terminal runs with persisted results from this experiment. Runs from other experiments are not included.</p>
+          <div id="comparison-loading" class="field-help" role="status" hidden>Loading eligible runs…</div>
+          <section id="comparison-error" class="comparison-feedback" hidden><p id="comparison-error-message"></p><button id="comparison-retry" class="secondary-action-button" type="button">Reload runs</button></section>
+          <p id="comparison-empty" class="field-help" hidden></p>
+          <fieldset id="comparison-run-selector" class="comparison-run-selector" hidden><legend>Select runs to compare</legend><div id="comparison-run-options" class="comparison-run-options"></div></fieldset>
+          <p id="comparison-selection-note" class="field-help" hidden></p>
+          <div id="comparison-table-wrap" class="results-comparison-table-wrap" hidden><table class="results-comparison-table"><thead id="comparison-table-head"></thead><tbody id="comparison-table-body"></tbody></table></div>
+          <p id="comparison-limitation-note" class="field-help results-help" hidden>Performance values are displayed with their persisted completeness state. No improvement percentages are inferred.</p>
+        </section>
+      </div>
+    </section>
+
+    <section id="failure-recovery-view" class="route-view failure-recovery-page" data-route-view="failureRecovery" aria-labelledby="failure-recovery-title" hidden>
+      <header class="failure-page-heading">
+        <div class="failure-page-intro">
+          <p class="eyebrow">ARCHITECTURE ANALYSIS</p>
+          <h1 id="failure-recovery-title">Failure &amp; Recovery Analysis</h1>
+          <p class="intro-copy">How StreamPulse handles likely component failures, what the code can detect, and where recovery still needs an operator.</p>
+        </div>
+        <aside class="failure-scope-card" role="note">
+          <span class="failure-scope-label">ARCHITECTURE REFERENCE</span>
+          <p>Describes possible failure paths and implemented safeguards; it does not run failure simulations or show live component status.</p>
+        </aside>
+      </header>
+
+      <section class="panel architecture-map" aria-labelledby="architecture-map-title">
+        <div class="architecture-map-heading">
+          <div><p class="eyebrow">EVENT &amp; METRIC PATH</p><h2 id="architecture-map-title">How the components connect</h2></div>
+          <span class="architecture-map-caption">Current StreamPulse architecture</span>
+        </div>
+        <div class="architecture-flow" role="group" aria-label="FastAPI publishes events to RabbitMQ; the consumer processes them and writes metrics to Redis">
+          <article class="architecture-flow-node api-node"><span class="architecture-flow-kicker">01 · API</span><h3>FastAPI</h3><p>Publishes events and reads metrics and service status.</p></article>
+          <div class="architecture-flow-link"><span>publishes</span><span class="architecture-flow-arrow" aria-hidden="true"></span></div>
+          <article class="architecture-flow-node broker-node"><span class="architecture-flow-kicker">02 · BROKER</span><h3>RabbitMQ</h3><p>Queues published events for the consumer.</p></article>
+          <div class="architecture-flow-link"><span>delivers</span><span class="architecture-flow-arrow" aria-hidden="true"></span></div>
+          <article class="architecture-flow-node consumer-node"><span class="architecture-flow-kicker">03 · PROCESSOR</span><h3>Consumer</h3><p>Validates deliveries, updates windows, and records measurements.</p></article>
+          <div class="architecture-flow-link"><span>writes</span><span class="architecture-flow-arrow" aria-hidden="true"></span></div>
+          <article class="architecture-flow-node redis-node"><span class="architecture-flow-kicker">04 · STORE</span><h3>Redis</h3><p>Holds current summaries, monitoring snapshots, and bounded samples.</p></article>
+        </div>
+        <p class="architecture-map-note">Run definitions, lifecycle state, and finalized results are stored in SQLite. FastAPI reads current metrics and monitoring data from Redis.</p>
+      </section>
+
+      <div class="failure-accordion-list">
+        <details class="panel failure-accordion consumer-accordion">
+          <summary><span class="accordion-index">C</span><span class="accordion-heading"><strong>Consumer Failure &amp; Recovery</strong><small>Separate process · receives and processes queued events</small></span><span class="component-chip">PROCESSOR</span></summary>
+          <div class="failure-analysis-content">
+            <article class="analysis-point analysis-role"><h3><span class="analysis-point-index">01</span>Component role</h3><p>The separate <code>run_consumer.py</code> process receives RabbitMQ events, validates them, updates the tumbling and sliding windows, and writes available summaries and measurements to Redis.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">02</span>Possible failure scenarios</h3><p>The process or host can stop during a delivery; event decoding or processing can fail; Redis or SQLite can be unavailable while a run-scoped delivery is being handled.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">03</span>System impact</h3><p>Consumption pauses while no consumer is active. Window buffers live in process memory and are lost on restart. Previously written Redis summaries may still be available, but the code does not archive them elsewhere and partial windows are not restored.</p></article>
+            <article class="analysis-point analysis-detection"><h3><span class="analysis-point-index">04</span>Failure detection <span class="implementation-tag">IMPLEMENTED</span></h3><p>The consumer writes a Redis heartbeat; <code>GET /api/monitoring</code> reports consumer state and freshness. Callback failures are logged and reflected in counters when those writes succeed.</p></article>
+            <article class="analysis-point analysis-recovery"><h3><span class="analysis-point-index">05</span>Recovery strategy</h3><p><span class="implementation-tag">IMPLEMENTED</span> The consumer connects with <code>aio_pika.connect_robust</code>, uses manual acknowledgements, and requeues selected transient failures. Run-scoped durable reservations can be settled after redelivery.</p><p><span class="proposal-tag">OPERATOR ACTION</span> Restart a process that has exited and inspect any pending reservations. This repository does not supervise or automatically restart the consumer process.</p></article>
+            <article class="analysis-point analysis-integrity"><h3><span class="analysis-point-index">06</span>Data integrity</h3><p>A delivery can be redelivered, so processing is at-least-once-oriented; exactly-once processing is not guaranteed. SQLite run receipts preserve processing outcomes, but in-memory window contents can be lost. Messages rejected without requeue may be discarded because this project does not declare a dead-letter exchange.</p></article>
+          </div>
+        </details>
+
+        <details class="panel failure-accordion rabbitmq-accordion">
+          <summary><span class="accordion-index">R</span><span class="accordion-heading"><strong>RabbitMQ Failure &amp; Recovery</strong><small>Message broker · transports events from API to consumer</small></span><span class="component-chip">BROKER</span></summary>
+          <div class="failure-analysis-content">
+            <article class="analysis-point analysis-role"><h3><span class="analysis-point-index">01</span>Component role</h3><p>RabbitMQ transports published library events from FastAPI to the separate consumer.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">02</span>Possible failure scenarios</h3><p>The broker may be unreachable, a connection may drop during publish or delivery, a publisher confirmation may be lost, or the queue may accumulate messages while no consumer is active.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">03</span>System impact</h3><p>Publish requests can fail or have an uncertain outcome. Consumption can pause and queued work can be delayed. An uncertain publish cannot safely be assumed accepted or rejected.</p></article>
+            <article class="analysis-point analysis-detection"><h3><span class="analysis-point-index">04</span>Failure detection <span class="implementation-tag">IMPLEMENTED</span></h3><p>The API health and monitoring endpoints expose RabbitMQ availability and queue-ready/consumer counts when inspection succeeds. Publisher failures are returned through API error responses; run accounting can retain an unknown publish outcome.</p></article>
+            <article class="analysis-point analysis-recovery"><h3><span class="analysis-point-index">05</span>Recovery strategy</h3><p><span class="implementation-tag">IMPLEMENTED</span> The publisher uses a robust connection, publisher confirms, persistent messages, and a durable queue. The consumer uses a durable single-active-consumer queue with manual acknowledgements.</p><p><span class="proposal-tag">OPERATOR ACTION</span> Restore broker service and verify queued work and uncertain run reservations. No broker failover deployment or operator alerting is configured by this repository.</p></article>
+            <article class="analysis-point analysis-integrity"><h3><span class="analysis-point-index">06</span>Data integrity</h3><p>A connection loss after publish begins can leave acceptance unknown. Run reservations remain pending rather than being republished automatically, avoiding an automatic duplicate. Acknowledgement loss can still cause redelivery. The project does not claim zero message loss or exactly-once effects.</p></article>
+          </div>
+        </details>
+
+        <details class="panel failure-accordion redis-accordion">
+          <summary><span class="accordion-index">R</span><span class="accordion-heading"><strong>Redis Failure &amp; Recovery</strong><small>Metrics store · configuration, summaries, monitoring and samples</small></span><span class="component-chip">DATA STORE</span></summary>
+          <div class="failure-analysis-content">
+            <article class="analysis-point analysis-role"><h3><span class="analysis-point-index">01</span>Component role</h3><p>Redis stores current window summaries, active and pending window configuration, monitoring snapshots, and bounded run-scoped and overall measurement samples.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">02</span>Possible failure scenarios</h3><p>Redis may be unreachable, a write or read can time out or fail, stored configuration can be invalid, or expiring measurement keys can no longer be read.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">03</span>System impact</h3><p>Health and monitoring can report Redis unavailable. A window-summary write failure can cause consumer processing to fail. Measurement writes are best effort, so events can be processed without corresponding latency samples; final results may then be incomplete.</p></article>
+            <article class="analysis-point analysis-detection"><h3><span class="analysis-point-index">04</span>Failure detection <span class="implementation-tag">IMPLEMENTED</span></h3><p><code>GET /api/health</code> reports service status; <code>GET /api/monitoring</code> reports Redis status, consumer heartbeat, and the consumer's last observed aggregation-write state. Storage errors are logged or returned as unavailable responses.</p></article>
+            <article class="analysis-point analysis-recovery"><h3><span class="analysis-point-index">05</span>Recovery strategy</h3><p><span class="implementation-tag">IMPLEMENTED</span> Callers expose failed reads/writes and keep monitoring/measurement writes best effort where coded. At consumer startup, the active window configuration is read from Redis or initialized if absent.</p><p><span class="proposal-tag">OPERATOR ACTION</span> Restore Redis and restart or re-establish affected processes as appropriate. This repository does not implement a Redis recovery orchestrator or a historical measurement archive.</p></article>
+            <article class="analysis-point analysis-integrity"><h3><span class="analysis-point-index">06</span>Data integrity</h3><p>Do not treat missing Redis measurements as zero. Measurement keys are bounded and expire; Redis summaries are not the durable run-result record. Finalized run results are persisted in SQLite, but their measurement completeness depends on the data available when finalization runs.</p></article>
+          </div>
+        </details>
+
+        <details class="panel failure-accordion fastapi-accordion">
+          <summary><span class="accordion-index">F</span><span class="accordion-heading"><strong>FastAPI Failure &amp; Recovery</strong><small>HTTP API · validates requests and manages runs</small></span><span class="component-chip">API SERVICE</span></summary>
+          <div class="failure-analysis-content">
+            <article class="analysis-point analysis-role"><h3><span class="analysis-point-index">01</span>Component role</h3><p>FastAPI serves the frontend, validates API requests, persists experiment and run state in SQLite, and publishes events through RabbitMQ. A bounded workload runner is launched as an in-process task after a run is started.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">02</span>Possible failure scenarios</h3><p>The API process or host can stop, SQLite can be unavailable, or an API request can fail while publishing or creating a run. An in-process runner can be cancelled or interrupted during shutdown.</p></article>
+            <article class="analysis-point"><h3><span class="analysis-point-index">03</span>System impact</h3><p>HTTP actions and reads are unavailable while the service is down. The recent-event display is process-local and resets with the process. SQLite records persist on disk, but a runner task is not a separate durable job queue.</p></article>
+            <article class="analysis-point analysis-detection"><h3><span class="analysis-point-index">04</span>Failure detection <span class="implementation-tag">IMPLEMENTED</span></h3><p><code>GET /api/health</code> reports API availability and service configuration status. Routes return validation or service errors for handled failures, and background task failures are logged by exception type.</p></article>
+            <article class="analysis-point analysis-recovery"><h3><span class="analysis-point-index">05</span>Recovery strategy</h3><p><span class="implementation-tag">IMPLEMENTED</span> Graceful shutdown cancels and awaits runner tasks and tracked finalizers; execution claims and interruption records keep unsafe work fail-closed.</p><p><span class="proposal-tag">OPERATOR ACTION</span> Restart the API process after its dependencies are available and inspect interrupted runs. No external process supervisor, replicated API service, or automatic run resumption is implemented here.</p></article>
+            <article class="analysis-point analysis-integrity"><h3><span class="analysis-point-index">06</span>Data integrity</h3><p>SQLite-backed experiment, run, and finalized-result records survive an API process restart when the same database path is used. In-memory recent events do not. A client timeout does not prove that a request had no effect; clients should read persisted state before retrying a non-idempotent action.</p></article>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section id="experiment-create-view" class="route-view experiment-create-page" data-route-view="create" aria-labelledby="create-experiment-title" hidden>
+      <div class="create-page-heading">
+        <a class="back-link" href="/experiments" data-route-link>← Experiments</a>
+        <p class="eyebrow">NEW DEFINITION</p>
+        <h1 id="create-experiment-title">Create Experiment</h1>
+        <p class="intro-copy">Set defaults for future runs. Creating an experiment does not create or start a run.</p>
+      </div>
+
+      <form id="experiment-form" class="experiment-form" novalidate>
+        <section class="panel experiment-form-section" aria-labelledby="experiment-details-heading">
+          <div class="form-section-heading"><span>01</span><div><p class="eyebrow">IDENTITY</p><h2 id="experiment-details-heading">Experiment Details</h2></div></div>
+          <div class="experiment-form-grid">
+            <div class="form-field form-field-wide">
+              <label for="experiment-name">Experiment name <span aria-hidden="true">*</span></label>
+              <input id="experiment-name" name="name" type="text" maxlength="160" autocomplete="off" required aria-describedby="experiment-name-error">
+              <span id="experiment-name-error" class="field-error" aria-live="polite"></span>
+            </div>
+            <div class="form-field form-field-wide">
+              <label for="experiment-description">Description <span class="optional-label">Optional</span></label>
+              <textarea id="experiment-description" name="description" maxlength="2000" rows="3" aria-describedby="experiment-description-error"></textarea>
+              <span id="experiment-description-error" class="field-error" aria-live="polite"></span>
+            </div>
+            <div class="form-field">
+              <label for="experiment-type">Experiment type <span aria-hidden="true">*</span></label>
+              <select id="experiment-type" name="experiment_type" required>
+                <option value="window_performance">Window performance</option>
+                <option value="window_configuration_comparison">Window configuration comparison</option>
+                <option value="throughput_benchmark">Throughput benchmark</option>
+                <option value="reliability_testing">Reliability testing</option>
+              </select>
+              <span class="field-help">Type is metadata; workload execution is the same bounded runner for every type.</span>
+              <span id="experiment-type-error" class="field-error" aria-live="polite"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel experiment-form-section" aria-labelledby="window-defaults-heading">
+          <div class="form-section-heading"><span>02</span><div><p class="eyebrow">PROCESSING</p><h2 id="window-defaults-heading">Window Configuration</h2></div></div>
+          <p class="form-section-copy">These defaults are saved with the experiment. Each new run keeps its own configuration snapshot.</p>
+          <div class="experiment-form-grid three-columns">
+            <div class="form-field">
+              <label for="default-tumbling-size">Tumbling window size <span aria-hidden="true">*</span></label>
+              <select id="default-tumbling-size" name="tumbling_size" required>
+                <option value="5">5 events</option><option value="8">8 events</option><option value="10" selected>10 events</option>
+              </select>
+              <span id="tumbling-size-error" class="field-error" aria-live="polite"></span>
+            </div>
+            <div class="form-field">
+              <label for="default-sliding-size">Sliding window size <span aria-hidden="true">*</span></label>
+              <select id="default-sliding-size" name="sliding_size" required>
+                <option value="5" selected>5 events</option><option value="8">8 events</option><option value="10">10 events</option>
+              </select>
+              <span id="sliding-size-error" class="field-error" aria-live="polite"></span>
+            </div>
+            <div class="form-field">
+              <label for="default-sliding-interval">Sliding interval <span aria-hidden="true">*</span></label>
+              <select id="default-sliding-interval" name="sliding_interval" required></select>
+              <span class="field-help">Update after this many new events; must be smaller than the window.</span>
+              <span id="sliding-interval-error" class="field-error" aria-live="polite"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel experiment-form-section" aria-labelledby="workload-defaults-heading">
+          <div class="form-section-heading"><span>03</span><div><p class="eyebrow">INPUT</p><h2 id="workload-defaults-heading">Workload Configuration</h2></div></div>
+          <p class="form-section-copy">Choose the workload size and pace. Event weights are relative chances, not percentages.</p>
+          <div class="experiment-form-grid two-columns">
+            <div class="form-field">
+              <label for="target-event-count">Target events <span aria-hidden="true">*</span></label>
+              <input id="target-event-count" name="target_event_count" type="number" min="1" max="10000" step="1" value="100" required aria-describedby="target-event-count-help target-event-count-error">
+              <span id="target-event-count-help" class="field-help">Choose 1 to 10,000 events.</span>
+              <span id="target-event-count-error" class="field-error" aria-live="polite"></span>
+            </div>
+            <div class="form-field">
+              <label for="publish-interval-ms">Publish interval <span aria-hidden="true">*</span></label>
+              <div class="input-with-unit"><input id="publish-interval-ms" name="publish_interval_ms" type="number" min="10" max="60000" step="1" value="100" required aria-describedby="publish-interval-help publish-interval-error"><span>ms</span></div>
+              <span id="publish-interval-help" class="field-help">Choose 10 to 60,000 milliseconds between events.</span>
+              <span id="publish-interval-error" class="field-error" aria-live="polite"></span>
+            </div>
+          </div>
+          <fieldset class="event-distribution-fieldset">
+            <legend>Event type distribution <span aria-hidden="true">*</span></legend>
+            <p class="field-help">Select at least one event type. Higher weights make that event type more likely.</p>
+            <div class="event-weight-list">
+              <div class="event-weight-row">
+                <label class="event-type-choice"><input type="checkbox" name="event_type" value="BOOK_ISSUED" checked><span>Book issued</span></label>
+                <label class="weight-field" for="weight-book-issued">Weight<input id="weight-book-issued" type="number" min="1" max="1000" step="1" value="1" data-event-weight="BOOK_ISSUED" aria-label="Weight for Book issued"></label>
+              </div>
+              <div class="event-weight-row">
+                <label class="event-type-choice"><input type="checkbox" name="event_type" value="BOOK_RETURNED" checked><span>Book returned</span></label>
+                <label class="weight-field" for="weight-book-returned">Weight<input id="weight-book-returned" type="number" min="1" max="1000" step="1" value="1" data-event-weight="BOOK_RETURNED" aria-label="Weight for Book returned"></label>
+              </div>
+              <div class="event-weight-row">
+                <label class="event-type-choice"><input type="checkbox" name="event_type" value="BOOK_RESERVED" checked><span>Book reserved</span></label>
+                <label class="weight-field" for="weight-book-reserved">Weight<input id="weight-book-reserved" type="number" min="1" max="1000" step="1" value="1" data-event-weight="BOOK_RESERVED" aria-label="Weight for Book reserved"></label>
+              </div>
+            </div>
+            <span id="event-distribution-error" class="field-error" aria-live="polite"></span>
+          </fieldset>
+        </section>
+
+        <div id="experiment-form-message" class="form-submit-message" role="status" aria-live="polite" hidden></div>
+        <div class="experiment-form-actions">
+          <a class="secondary-action-button" href="/experiments" data-route-link>Cancel</a>
+          <button id="create-experiment-submit" class="primary-action-button" type="submit">Create Experiment</button>
+        </div>
+      </form>
+    </section>
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" crossorigin="anonymous"></script>
-  <script src="app.js?v=redis-reporting-1"></script>
+  <script src="/static/app.js?v=phase4-experiment-cta-1"></script>
 </body>
 </html>

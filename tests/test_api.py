@@ -6,7 +6,7 @@ import pytest
 
 import app.main as main_module
 from app.main import create_app
-from app.messaging.rabbitmq import RabbitMQError, RabbitMQSettings
+from app.messaging.rabbitmq import RabbitMQError, RabbitMQPublisher, RabbitMQSettings, RabbitMQPublishError
 from app.processing.metrics import Metrics
 from app.processing.window_config import WindowConfiguration
 from app.schemas import EventType, LibraryEvent
@@ -20,6 +20,102 @@ from app.storage.redis_metrics import (
 )
 
 
+def test_frontend_root_and_static_assets_are_served():
+    with TestClient(create_app(publisher=FakePublisher(), metrics_store=FakeMetricsStore())) as client:
+        page = client.get("/")
+        stylesheet = client.get("/static/styles.css")
+        script = client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert 'href="/static/styles.css?v=phase4-failure-analysis-1"' in page.text
+    assert 'src="/static/app.js?v=phase4-experiment-cta-1"' in page.text
+    assert stylesheet.status_code == 200
+    assert script.status_code == 200
+
+
+def test_failure_recovery_page_shows_architecture_scope_and_four_component_sections():
+    with TestClient(create_app(publisher=FakePublisher(), metrics_store=FakeMetricsStore())) as client:
+        page = client.get("/failure-recovery")
+
+    assert page.status_code == 200
+    assert page.text.count('class="panel failure-accordion') == 4
+    assert "Publishes events and reads metrics and service status." in page.text
+    assert "RabbitMQ Failure &amp; Recovery" in page.text
+    assert "Consumer Failure &amp; Recovery" in page.text
+    assert "Redis Failure &amp; Recovery" in page.text
+    assert "it does not run failure simulations or show live component status." in page.text
+    assert "Theory only." not in page.text
+    assert "System Architecture Simulation" not in page.text
+
+
+def test_monitoring_endpoint_inspects_single_active_queue_on_temporary_connection():
+    class Queue:
+        declaration_result = None
+        message_count = 0
+        consumer_count = 1
+
+        async def declare(self):
+            return self
+
+    class Channel:
+        def __init__(self):
+            self.closed = False
+            self.declarations = []
+
+        async def declare_queue(self, name, **kwargs):
+            self.declarations.append((name, kwargs))
+            return Queue()
+
+        async def close(self):
+            self.closed = True
+
+    class Connection:
+        def __init__(self):
+            self._channel = Channel()
+            self.closed = False
+
+        async def channel(self):
+            return self._channel
+
+        async def close(self):
+            self.closed = True
+
+    connections = []
+
+    async def connect(url):
+        assert url == "amqps://fake-host"
+        connection = Connection()
+        connections.append(connection)
+        return connection
+
+    publisher = RabbitMQPublisher(RabbitMQSettings("amqps://fake-host", "events"), connect=connect)
+    store = FakeMetricsStore(monitoring_snapshot=make_consumer_snapshot(), heartbeat_fresh=True)
+    with TestClient(create_app(publisher=publisher, metrics_store=store)) as client:
+        response = client.get("/api/monitoring")
+
+    assert response.status_code == 200
+    assert response.json()["rabbitmq"]["status"] == "available"
+    assert response.json()["rabbitmq"]["messages_ready"] == 0
+    assert response.json()["rabbitmq"]["consumer_count"] == 1
+    assert response.json()["rabbitmq"]["unacknowledged_messages"] is None
+    assert response.json()["api"]["redis_status"] == "available"
+    assert response.json()["consumer"]["status"] == "running"
+    assert connections[0]._channel.declarations == [(
+        "events", {"durable": True, "arguments": {"x-single-active-consumer": True}}
+    )]
+    assert connections[0]._channel.closed is True
+    assert connections[0].closed is True
+
+
+def test_project_environment_loader_uses_root_dotenv_without_overriding(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_module, "load_dotenv", lambda **kwargs: calls.append(kwargs))
+
+    main_module.load_project_environment()
+
+    assert calls == [{"dotenv_path": main_module.PROJECT_ROOT / ".env", "override": False}]
+
+
 class FakePublisher:
     def __init__(self, fail=False, *, queue_info=None, inspect_fail=False, queue="streampulse.events"):
         self.events = []
@@ -30,7 +126,7 @@ class FakePublisher:
 
     async def publish(self, event):
         if self.fail:
-            raise RabbitMQError("Could not publish library event to RabbitMQ")
+            raise RabbitMQPublishError("broker rejected publish", ambiguous=False)
         self.events.append(event)
 
     async def inspect_queue(self):
@@ -389,8 +485,8 @@ def test_sample_batch_reports_actual_successes_and_failures():
         "published": 3,
         "failed": 2,
         "failures": [
-            {"event_number": 2, "detail": "Could not publish event"},
-            {"event_number": 4, "detail": "Could not publish event"},
+                {"event_number": 2, "detail": "Publish outcome is unknown; reservation retained"},
+                {"event_number": 4, "detail": "Publish outcome is unknown; reservation retained"},
         ],
     }
     assert recent.json()["count"] == 3
@@ -638,7 +734,7 @@ def test_monitoring_endpoint_reports_queue_count_failure_without_exposing_except
     assert "fake" not in response.text.lower()
 
 
-def test_monitoring_response_does_not_expose_urls_or_credentials_and_health_contract_is_unchanged():
+def test_monitoring_response_does_not_expose_urls_or_credentials_and_verifies_health():
     publisher = FakePublisher(queue_info={"messages_ready": 0, "consumer_count": 0})
     store = FakeMetricsStore(monitoring_snapshot=make_consumer_snapshot(), heartbeat_fresh=True)
     with TestClient(create_app(publisher=publisher, metrics_store=store)) as client:
@@ -651,7 +747,7 @@ def test_monitoring_response_does_not_expose_urls_or_credentials_and_health_cont
     assert "secret" not in monitoring_response.text
     assert health_response.json() == {
         "status": "available",
-        "services": {"rabbitmq": "not_verified", "redis": "not_verified"},
+        "services": {"rabbitmq": "available", "redis": "available"},
     }
 
 

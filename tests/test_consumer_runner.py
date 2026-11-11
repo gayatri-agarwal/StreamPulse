@@ -34,9 +34,10 @@ async def test_build_consumer_initializes_default_configuration_when_missing(mon
             return self.pending
 
     class FakeConsumer:
-        def __init__(self, processor, settings):
+        def __init__(self, processor, settings, **kwargs):
             created["processor"] = processor
             created["settings"] = settings
+            created["consumer_options"] = kwargs
 
     monkeypatch.setattr(run_consumer, "RedisMetricsStore", FakeMetricsStore)
     monkeypatch.setattr(run_consumer, "RabbitMQConsumer", FakeConsumer)
@@ -82,8 +83,9 @@ async def test_build_consumer_recovers_custom_active_configuration_and_retains_p
             return persisted["pending"]
 
     class FakeConsumer:
-        def __init__(self, processor, settings):
+        def __init__(self, processor, settings, **kwargs):
             created["processor"] = processor
+            created["consumer_options"] = kwargs
 
     monkeypatch.setattr(run_consumer, "RedisMetricsStore", FakeMetricsStore)
     monkeypatch.setattr(run_consumer, "RabbitMQConsumer", FakeConsumer)

@@ -4,12 +4,19 @@ from dotenv import load_dotenv
 load_dotenv()
 import asyncio
 import logging
+from pathlib import Path
 from typing import Tuple
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
 
 from app.messaging.rabbitmq import RabbitMQConsumer, RabbitMQSettings
 from app.processing.event_processor import LibraryEventProcessor
 from app.processing.window_config import WindowConfiguration
 from app.processing.window_manager import SlidingWindow, TumblingWindow
+from app.experiments.store import ExperimentRepository
 from app.storage.redis_metrics import RedisMetricsStore
 
 
@@ -45,7 +52,11 @@ async def build_consumer() -> Tuple[RabbitMQConsumer, RedisMetricsStore]:
         metrics_store,
         active_configuration,
     )
-    return RabbitMQConsumer(processor, settings), metrics_store
+    return RabbitMQConsumer(
+        processor,
+        settings,
+        experiment_repository=ExperimentRepository(),
+    ), metrics_store
 
 
 async def run_consumer() -> None:
@@ -54,8 +65,17 @@ async def run_consumer() -> None:
     try:
         await consumer.run_forever()
     finally:
-        # run_forever closes the RabbitMQ connection in its own finally block.
-        await metrics_store.close()
+        # A timed-out callback may still be unwinding cancellation. Keep its
+        # Redis dependency alive until the process exits rather than closing a
+        # store that an active handler could still be using.
+        drain_result = getattr(consumer, "last_drain_result", None)
+        if drain_result is not None and drain_result.active_handlers_remaining:
+            logger.error(
+                "Leaving Redis open because %d consumer handler(s) remain active",
+                drain_result.active_handlers_remaining,
+            )
+        else:
+            await metrics_store.close()
 
 
 if __name__ == "__main__":

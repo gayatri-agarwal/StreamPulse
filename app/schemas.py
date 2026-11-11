@@ -5,6 +5,7 @@ from datetime import datetime
 from enum import Enum
 import math
 from typing import Any, Mapping, Optional
+from uuid import UUID
 
 
 class EventType(str, Enum):
@@ -25,6 +26,7 @@ class LibraryEvent:
     book_id: str
     timestamp: datetime
     value: Optional[float] = None
+    run_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         for field_name in ("event_id", "student_id", "book_id"):
@@ -48,6 +50,15 @@ class LibraryEvent:
             raise ValueError("timestamp must be a datetime or ISO 8601 string")
         object.__setattr__(self, "timestamp", parsed_timestamp)
 
+        if self.run_id is not None:
+            if not isinstance(self.run_id, str) or not self.run_id.strip():
+                raise ValueError("run_id must be a non-empty UUID string")
+            try:
+                normalized_run_id = str(UUID(self.run_id))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("run_id must be a valid UUID") from exc
+            object.__setattr__(self, "run_id", normalized_run_id)
+
         if self.value is None:
             return
         if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
@@ -60,7 +71,7 @@ class LibraryEvent:
     def from_mapping(cls, data: Mapping[str, Any]) -> "LibraryEvent":
         """Build an event from a mapping, rejecting missing or extra fields."""
         expected = {"event_id", "event_type", "student_id", "book_id", "timestamp"}
-        allowed = expected | {"value"}  # Legacy publishers may still send a value; consumers replace it.
+        allowed = expected | {"value", "run_id"}  # Legacy publishers may still send a value; consumers replace it.
         if not isinstance(data, Mapping):
             raise ValueError("event data must be a mapping")
         missing = expected - data.keys()
