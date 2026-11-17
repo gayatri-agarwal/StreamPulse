@@ -456,6 +456,25 @@ All routes are defined in `app/main.py`.
 | `POST` | `/api/events/batch` | Publishes a finite random sample batch | JSON `{ "batch_size": 5 }`, `8`, or `10`; returns requested, published, failed, and failure details |
 | `GET` | `/api/events` | Returns recent successfully published events from this API process | No input. Returns `source`, `count`, and `events` |
 | `GET` | `/api/metrics` | Reads the latest summaries from Redis | No input. Returns `tumbling` and `sliding`, each either a metric object or `null` |
+| `POST` | `/api/simulations/start` | Starts one background flow generator | JSON `flow_mode`: `steady`, `bursty`, or `late_arriving`; optional `interval_ms`, `burst_size`, `burst_interval_ms`, `lateness_ms`, `out_of_order_every` |
+| `POST` | `/api/simulations/stop` | Requests cooperative stop; an in-progress publish is allowed to settle | No body; returns the current session in `stopping` state |
+| `GET` | `/api/simulations/status` | Returns generator counters, queue observation, consumer status, simulation-scoped measurements, and isolated summaries | Values unavailable from Redis or RabbitMQ remain `null` |
+| `GET` | `/api/simulations/activity` | Returns up to 100 recent generated events and event/publish/processing timestamps where available | Activity is scoped to the API process's current simulation |
+
+Simulation events carry optional `simulation_id` and `published_at` fields;
+existing ordinary and run-scoped event payloads remain valid. Simulation
+windows and measurements use separate Redis namespaces, so simulator traffic
+does not enter ordinary dashboard summaries or experiment-run summaries. The
+API allows one generator per process, and a new server process starts with no
+active simulation because generator tasks are in memory.
+
+The `late_arriving` mode deliberately emits older, occasionally out-of-order
+event timestamps while preserving a separate UTC publish timestamp. The
+consumer still feeds these events to the existing event-count tumbling and
+sliding windows in RabbitMQ arrival order. This mode demonstrates late arrival;
+it does not implement event-time windows, watermarks, allowed lateness, or
+reopening completed windows. Consumer in-progress simulation windows are also
+in memory and reset if the consumer restarts.
 
 ### Submit one event
 
@@ -726,9 +745,17 @@ their prior restart behavior.
 - Recent events are stored only in the API process's bounded in-memory deque
   (100 events by default); they are not historical event storage.
 - The API and consumer have no authentication or authorization layer.
-- Monitoring uses a Redis heartbeat with a 30-second TTL. A stale heartbeat
-  indicates that the last running snapshot expired; it is not proof of the
-  exact failure cause.
+- Monitoring stores separate 30-second heartbeats and snapshots for each
+  consumer instance. A consumer becomes the reported active owner only when it
+  receives an actual RabbitMQ delivery; its heartbeat renews that owner lease
+  only while it still owns it. The RabbitMQ client does not expose a reliable
+  active/standby role notification, so an idle queue with no prior delivery
+  evidence is reported as unverified. On a single-active-consumer queue,
+  RabbitMQ delivery evidence identifies the current processing instance after
+  activity begins and allows the standby to take ownership after failover.
+- Aggregation-write evidence is atomically stored with the summary and includes
+  the writing consumer instance ID. A stale instance cannot replace a newer
+  owner's evidence or aggregation summary.
 - RabbitMQ queue inspection reports ready messages and consumer count, but
   unacknowledged message counts are explicitly unavailable.
 - The repository does not define a production deployment configuration or

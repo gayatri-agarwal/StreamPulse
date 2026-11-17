@@ -27,8 +27,10 @@ def test_frontend_root_and_static_assets_are_served():
         script = client.get("/static/app.js")
 
     assert page.status_code == 200
-    assert 'href="/static/styles.css?v=phase4-failure-analysis-1"' in page.text
-    assert 'src="/static/app.js?v=phase4-experiment-cta-1"' in page.text
+    assert 'href="/static/styles.css?v=phase5-lab-1"' in page.text
+    assert 'src="/static/app.js?v=phase5-lab-1"' in page.text
+    assert "Experiments" not in page.text
+    assert 'href="/failure-recovery"' in page.text
     assert stylesheet.status_code == 200
     assert script.status_code == 200
 
@@ -138,7 +140,8 @@ class FakePublisher:
 class FakeMetricsStore:
     def __init__(self, fail=False, *, monitoring_snapshot=None, heartbeat_fresh=None,
                  monitoring_error=None, heartbeat_error=None, configuration_error=None,
-                 active_configuration=None, pending_configuration=None):
+                 active_configuration=None, pending_configuration=None,
+                 aggregation_write_evidence=None, aggregation_evidence_error=None):
         self.fail = fail
         self.metrics = {
             "tumbling": Metrics(2, 3.0, 1.5, 1.0, 2.0),
@@ -153,6 +156,8 @@ class FakeMetricsStore:
         self.active_configuration = active_configuration
         self.pending_configuration = pending_configuration
         self.pending_writes = []
+        self.aggregation_write_evidence = aggregation_write_evidence
+        self.aggregation_evidence_error = aggregation_evidence_error
 
     async def get_metrics(self, window_type):
         self.requested.append(window_type)
@@ -165,10 +170,15 @@ class FakeMetricsStore:
             raise self.monitoring_error
         return self.monitoring_snapshot
 
-    async def is_monitoring_heartbeat_fresh(self):
+    async def is_monitoring_heartbeat_fresh(self, expected_instance_id=None):
         if self.heartbeat_error is not None:
             raise self.heartbeat_error
         return self.heartbeat_fresh
+
+    async def read_consumer_aggregation_write_evidence(self):
+        if self.aggregation_evidence_error is not None:
+            raise self.aggregation_evidence_error
+        return self.aggregation_write_evidence
 
     async def read_active_configuration(self):
         self._raise_configuration_error()
@@ -197,20 +207,21 @@ class FakeMetricsStore:
 
 
 def make_consumer_snapshot(consumer_state="running", consumer_redis_status="available"):
+    now = datetime.now(timezone.utc).isoformat()
     return ConsumerMonitoringSnapshot(
         consumer_state=consumer_state,
         consumer_instance_id="consumer-test-1",
-        last_heartbeat_at="2026-11-04T12:00:00+00:00",
+        last_heartbeat_at=now,
         processed_events_since_start=9,
         processing_failures_since_start=2,
         consumer_redis_status=consumer_redis_status,
-        last_successful_aggregation_write_at="2026-11-04T11:59:50+00:00",
+        last_successful_aggregation_write_at=now,
         tumbling_window_size=10,
         tumbling_window_progress=3,
         sliding_window_size=5,
         sliding_window_progress=5,
         sliding_interval="per_event",
-        last_completed_tumbling_aggregation_at="2026-11-04T11:58:00+00:00",
+        last_completed_tumbling_aggregation_at=now,
     )
 
 
@@ -605,7 +616,13 @@ def test_recent_events_are_bounded_to_configured_limit():
 
 def test_monitoring_endpoint_reports_running_consumer_and_supported_queue_information():
     publisher = FakePublisher(queue_info={"messages_ready": 6, "consumer_count": 1})
-    store = FakeMetricsStore(monitoring_snapshot=make_consumer_snapshot(), heartbeat_fresh=True)
+    evidence = datetime.now(timezone.utc).isoformat()
+    snapshot = make_consumer_snapshot()
+    store = FakeMetricsStore(monitoring_snapshot=snapshot, heartbeat_fresh=True,
+                             aggregation_write_evidence={
+                                 "consumer_instance_id": snapshot.consumer_instance_id,
+                                 "written_at": evidence,
+                             })
 
     with TestClient(create_app(publisher=publisher, metrics_store=store)) as client:
         response = client.get("/api/monitoring")
@@ -622,16 +639,19 @@ def test_monitoring_endpoint_reports_running_consumer_and_supported_queue_inform
     assert data["consumer"] == {
         "status": "running",
         "reason": None,
-        "last_heartbeat": "2026-11-04T12:00:00+00:00",
+        "last_heartbeat": snapshot.last_heartbeat_at,
         "processed_since_start": 9,
         "processing_failures_since_start": 2,
         "redis_status": "available",
-        "last_successful_aggregation_write": "2026-11-04T11:59:50+00:00",
+        "redis_reason": None,
+        "last_successful_aggregation_write": evidence,
+        "active_instance_id": snapshot.consumer_instance_id,
+        "instances": [],
         "windows": {
             "tumbling": {
                 "size": 10,
                 "progress": 3,
-                "last_completed_at": "2026-11-04T11:58:00+00:00",
+                "last_completed_at": snapshot.last_completed_tumbling_aggregation_at,
             },
             "sliding": {"size": 5, "progress": 5, "interval": "per_event"},
         },
@@ -683,7 +703,32 @@ def test_monitoring_endpoint_reports_current_consumer_redis_write_failure():
 
     assert response.status_code == 200
     assert response.json()["consumer"]["status"] == "running"
-    assert response.json()["consumer"]["redis_status"] == "unavailable"
+    assert response.json()["consumer"]["redis_status"] == "not_verified"
+    assert response.json()["consumer"]["redis_reason"] == "no_successful_aggregation_write"
+
+
+@pytest.mark.parametrize(
+    ("evidence", "error", "expected_reason"),
+    [
+        (None, None, "no_successful_aggregation_write"),
+        ({"consumer_instance_id": "consumer-test-1", "written_at": "2020-01-01T00:00:00+00:00"},
+         None, "aggregation_write_evidence_expired"),
+        (None, RedisMonitoringDataError("invalid"), "invalid_aggregation_write_evidence"),
+        (None, RedisMonitoringError("unavailable"), "redis_unavailable"),
+    ],
+)
+def test_monitoring_requires_fresh_valid_aggregation_write_evidence(evidence, error, expected_reason):
+    store = FakeMetricsStore(
+        monitoring_snapshot=make_consumer_snapshot(), heartbeat_fresh=True,
+        aggregation_write_evidence=evidence, aggregation_evidence_error=error,
+    )
+    with TestClient(create_app(publisher=FakePublisher(), metrics_store=store)) as client:
+        response = client.get("/api/monitoring")
+    data = response.json()
+    assert data["consumer"]["redis_status"] == "not_verified"
+    assert data["consumer"]["redis_reason"] == expected_reason
+    if expected_reason == "redis_unavailable":
+        assert data["api"]["redis_status"] == "unavailable"
 
 
 def test_monitoring_endpoint_does_not_infer_crash_when_monitoring_never_initialized():

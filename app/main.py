@@ -1,17 +1,17 @@
 """FastAPI application for publishing library events and reading metrics."""
 from dotenv import load_dotenv
-
-load_dotenv()
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import asyncio
+import hashlib
 import inspect
 import logging
 import math
 import random
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Optional
 from uuid import UUID, uuid4
@@ -34,6 +34,9 @@ from app.experiments.store import (
 from app.experiments.runner import EventPublishResult, ExperimentWorkloadRunner
 from app.messaging.rabbitmq import RabbitMQError, RabbitMQPublisher, RabbitMQPublishError
 from app.processing.window_config import WindowConfiguration
+from app.simulation.engine import (
+    SimulationAlreadyRunning, SimulationEngine, SimulationStart, SimulationStartupError,
+)
 from app.schemas import EventType, LibraryEvent
 from app.storage.redis_metrics import (
     RedisMetricsStore,
@@ -42,6 +45,7 @@ from app.storage.redis_metrics import (
     RedisMonitoringDataError,
     RedisMonitoringError,
     RedisStorageError,
+    CONSUMER_AGGREGATION_WRITE_EVIDENCE_TTL_SECONDS,
     MEASUREMENT_STORAGE_OPERATION_TIMEOUT_SECONDS,
 )
 
@@ -151,6 +155,8 @@ def _event_data(event: LibraryEvent) -> Dict[str, Any]:
         "book_id": event.book_id,
         "timestamp": event.timestamp.isoformat(),
         **({"run_id": event.run_id} if event.run_id is not None else {}),
+        **({"simulation_id": event.simulation_id} if event.simulation_id is not None else {}),
+        **({"published_at": event.published_at.isoformat()} if event.published_at is not None else {}),
         **({"value": event.value} if event.value is not None else {}),
     }
 
@@ -177,6 +183,10 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         await asyncio.to_thread(application.state.experiment_store.initialize)
+        logger.info(
+            "experiment_repository_initialized component=api database_path=%s",
+            application.state.experiment_store.database_path.resolve(),
+        )
         if application.state.publisher is None:
             try:
                 application.state.publisher = RabbitMQPublisher()
@@ -189,6 +199,23 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                 application.state.redis_status = "not_verified"
             except ValueError:
                 application.state.redis_status = "not_configured"
+        application.state.simulation_engine = SimulationEngine(
+            application.state.metrics_store,
+            publish_event_through_existing_path,
+            queue_inspector=getattr(application.state.publisher, "inspect_queue", None),
+            monitoring_reader=(getattr(application.state.metrics_store, "read_active_consumer_monitoring", None)
+                               or getattr(application.state.metrics_store, "read_monitoring_state", None)),
+        )
+        publisher_settings = getattr(application.state.publisher, "settings", None)
+        rabbit_url = getattr(publisher_settings, "url", None)
+        metrics_store = application.state.metrics_store
+        logger.info(
+            "service_connection_identity component=api rabbitmq_target=%s rabbitmq_queue=%s rabbitmq_fingerprint=%s redis_target=%s",
+            getattr(publisher_settings, "connection_identity", None) or "unavailable",
+            getattr(publisher_settings, "queue", "unavailable"),
+            hashlib.sha256(rabbit_url.encode("utf-8")).hexdigest()[:12] if rabbit_url else "unavailable",
+            getattr(metrics_store, "connection_identity", None) or "unavailable",
+        )
         # Recreate drain retry coordinators from durable stop intents after restart.
         try:
             experiments = await database_call(application.state.experiment_store.list_experiments)
@@ -211,6 +238,9 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
         try:
             yield
         finally:
+            simulation_engine = application.state.simulation_engine
+            if simulation_engine is not None:
+                await simulation_engine.shutdown()
             runner_tasks = list(application.state.experiment_runner_tasks.values())
             application.state.shutting_down = True
             # Close admission cooperatively and let in-flight publish outcomes settle.
@@ -258,22 +288,8 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
 
     application = FastAPI(title="StreamPulse API", version="0.4.0", lifespan=lifespan)
     @application.get("/", include_in_schema=False)
-    @application.get("/experiments", include_in_schema=False)
-    @application.get("/experiments/new", include_in_schema=False)
     @application.get("/failure-recovery", include_in_schema=False)
     async def frontend_index() -> FileResponse:
-        return FileResponse(FRONTEND_DIR / "index.html")
-
-    @application.get("/experiments/{experiment_id:uuid}", include_in_schema=False)
-    async def frontend_experiment_detail(experiment_id: UUID) -> FileResponse:
-        return FileResponse(FRONTEND_DIR / "index.html")
-
-    @application.get("/experiments/{experiment_id:uuid}/runs/{run_id:uuid}", include_in_schema=False)
-    async def frontend_experiment_run(experiment_id: UUID, run_id: UUID) -> FileResponse:
-        return FileResponse(FRONTEND_DIR / "index.html")
-
-    @application.get("/experiments/{experiment_id:uuid}/runs/{run_id:uuid}/results", include_in_schema=False)
-    async def frontend_experiment_results(experiment_id: UUID, run_id: UUID) -> FileResponse:
         return FileResponse(FRONTEND_DIR / "index.html")
 
     application.add_middleware(
@@ -290,6 +306,7 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
     application.state.recent_events = deque(maxlen=recent_event_limit)
     application.state.experiment_runner_tasks = {}
     application.state.experiment_finalization_tasks = {}
+    application.state.simulation_engine = None
     application.state.shutting_down = False
     application.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
     batch_publish_lock = asyncio.Lock()
@@ -304,6 +321,8 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
             await asyncio.wait_for(
                 recorder(
                     run_id=event.run_id,
+                    **({"simulation_id": event.simulation_id}
+                       if event.simulation_id is not None else {}),
                     counters={"publish_attempts": 1,
                               "publish_successes": int(succeeded),
                               "publish_failures": int(not succeeded)},
@@ -401,12 +420,17 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
         api_redis_status = application.state.redis_status
         store = application.state.metrics_store
         snapshot = None
+        consumer_instances = []
         consumer_status = "unavailable"
         consumer_reason = "monitoring_not_configured" if store is None else "not_initialized"
 
         if store is not None:
             try:
-                snapshot = await store.read_monitoring_state()
+                read_active = getattr(store, "read_active_consumer_monitoring", None)
+                if callable(read_active):
+                    snapshot, consumer_instances = await read_active()
+                else:
+                    snapshot = await store.read_monitoring_state()
                 api_redis_status = "available"
                 application.state.redis_status = "available"
             except RedisMonitoringDataError:
@@ -422,10 +446,32 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                 api_redis_status = "unavailable"
                 application.state.redis_status = "unavailable"
                 consumer_reason = "redis_unavailable"
-            else:
-                if snapshot is not None:
+            if api_redis_status != "unavailable":
+                if snapshot is None and consumer_instances:
+                    fresh_instances = [entry for entry in consumer_instances if entry.get("heartbeat_fresh")]
+                    stale_owner = any(
+                        entry.get("delivery_owner") and not entry.get("heartbeat_fresh")
+                        for entry in consumer_instances
+                    )
+                    stopped_instances = [entry for entry in consumer_instances
+                                         if entry.get("consumer_state") == "stopped"]
+                    if fresh_instances:
+                        consumer_status = "not_verified"
+                        consumer_reason = "no_delivery_evidence"
+                    elif stale_owner:
+                        consumer_status = "stale"
+                        consumer_reason = "heartbeat_expired"
+                    elif stopped_instances:
+                        consumer_status = "stopped"
+                        consumer_reason = None
+                elif snapshot is not None:
                     try:
-                        heartbeat_fresh = await store.is_monitoring_heartbeat_fresh()
+                        try:
+                            heartbeat_fresh = await store.is_monitoring_heartbeat_fresh(
+                                snapshot.consumer_instance_id
+                            )
+                        except TypeError:
+                            heartbeat_fresh = await store.is_monitoring_heartbeat_fresh()
                         api_redis_status = "available"
                         application.state.redis_status = "available"
                     except RedisMonitoringError:
@@ -477,12 +523,66 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                 application.state.rabbitmq_status = "unavailable"
 
         consumer_redis_status = "not_verified"
-        if (
-            consumer_status == "running"
-            and snapshot is not None
-            and snapshot.consumer_redis_status in {"available", "unavailable"}
-        ):
-            consumer_redis_status = snapshot.consumer_redis_status
+        aggregation_write_at = None
+        aggregation_write_reason = (
+            "no_active_consumer_delivery" if snapshot is None
+            else "no_successful_aggregation_write"
+        )
+        if consumer_status == "running" and store is not None:
+            read_evidence = getattr(store, "read_consumer_aggregation_write_evidence", None)
+            if callable(read_evidence):
+                try:
+                    aggregation_write_at = await read_evidence()
+                except RedisMonitoringDataError:
+                    aggregation_write_reason = "invalid_aggregation_write_evidence"
+                except (RedisMonitoringError, Exception):
+                    aggregation_write_reason = "redis_unavailable"
+                    api_redis_status = "unavailable"
+                    application.state.redis_status = "unavailable"
+                else:
+                    if aggregation_write_at is not None:
+                        if (not isinstance(aggregation_write_at, dict)
+                                or aggregation_write_at.get("consumer_instance_id")
+                                != snapshot.consumer_instance_id):
+                            aggregation_write_at = None
+                            aggregation_write_reason = "aggregation_write_from_different_consumer"
+                        else:
+                            try:
+                                written_at = aggregation_write_at.get("written_at")
+                                parsed_write_at = datetime.fromisoformat(
+                                    written_at.replace("Z", "+00:00")
+                                )
+                                age_seconds = (datetime.now(timezone.utc) - parsed_write_at).total_seconds()
+                                if 0 <= age_seconds <= CONSUMER_AGGREGATION_WRITE_EVIDENCE_TTL_SECONDS:
+                                    consumer_redis_status = "available"
+                                    aggregation_write_reason = None
+                                    aggregation_write_at = written_at
+                                else:
+                                    aggregation_write_reason = "aggregation_write_evidence_expired"
+                                    aggregation_write_at = None
+                            except (AttributeError, TypeError, ValueError):
+                                aggregation_write_at = None
+                                aggregation_write_reason = "invalid_aggregation_write_evidence"
+            elif snapshot is not None and snapshot.consumer_redis_status == "unavailable":
+                consumer_redis_status = "unavailable"
+                aggregation_write_reason = "latest_aggregation_write_failed"
+
+        if consumer_redis_status == "available" and snapshot is not None:
+            refresh_owner_check = getattr(store, "is_monitoring_heartbeat_fresh", None)
+            if callable(refresh_owner_check):
+                try:
+                    try:
+                        still_owner = await refresh_owner_check(snapshot.consumer_instance_id)
+                    except TypeError:
+                        still_owner = await refresh_owner_check()
+                except Exception:
+                    still_owner = None
+                if still_owner is not True:
+                    consumer_status = "stale"
+                    consumer_reason = "active_consumer_changed_during_read"
+                    consumer_redis_status = "not_verified"
+                    aggregation_write_reason = "active_consumer_changed_during_read"
+                    aggregation_write_at = None
 
         measurement_summary = None
         read_measurements = getattr(store, "get_measurement_summary", None)
@@ -513,7 +613,10 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                 "processed_since_start": snapshot.processed_events_since_start if snapshot is not None else None,
                 "processing_failures_since_start": snapshot.processing_failures_since_start if snapshot is not None else None,
                 "redis_status": consumer_redis_status,
-                "last_successful_aggregation_write": snapshot.last_successful_aggregation_write_at if snapshot is not None else None,
+                "redis_reason": aggregation_write_reason,
+                "last_successful_aggregation_write": aggregation_write_at,
+                "active_instance_id": snapshot.consumer_instance_id if snapshot is not None else None,
+                "instances": consumer_instances,
                 "windows": {
                     "tumbling": {
                         "size": snapshot.tumbling_window_size if snapshot is not None else None,
@@ -547,6 +650,38 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                     **asdict(await read_measurements(run_id))}
         except Exception:
             raise HTTPException(status_code=503, detail="Measurement storage is unavailable") from None
+
+    @application.post("/api/simulations/start", status_code=status.HTTP_202_ACCEPTED)
+    async def start_simulation(payload: SimulationStart) -> Dict[str, Any]:
+        try:
+            simulation = await application.state.simulation_engine.start(payload)
+            return {"status": "accepted", "simulation": simulation}
+        except SimulationAlreadyRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except SimulationStartupError:
+            raise HTTPException(status_code=503, detail="Simulation storage is unavailable") from None
+        except Exception as exc:
+            frames = "".join(
+                f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
+                for frame in traceback.extract_tb(exc.__traceback__)
+            )
+            logger.error(
+                "simulation_startup_failed operation=unexpected_simulation_startup_failure exception_type=%s\n%s",
+                type(exc).__name__, frames,
+            )
+            raise HTTPException(status_code=503, detail="Simulation storage is unavailable") from None
+
+    @application.post("/api/simulations/stop", status_code=status.HTTP_202_ACCEPTED)
+    async def stop_simulation() -> Dict[str, Any]:
+        return {"status": "stop_requested", "simulation": await application.state.simulation_engine.stop()}
+
+    @application.get("/api/simulations/status")
+    async def simulation_status() -> Dict[str, Any]:
+        return await application.state.simulation_engine.status()
+
+    @application.get("/api/simulations/activity")
+    async def simulation_activity() -> Dict[str, Any]:
+        return await application.state.simulation_engine.activity()
 
     async def database_call(method: Any, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(method, *args, **kwargs)
@@ -669,7 +804,61 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
             raise_experiment_error(exc)
         if not run["result_available"]:
             raise HTTPException(status_code=409, detail="Run results are not available until the run is terminal")
-        return {"run_id": run["run_id"], "results": run["results"]}
+        window_summaries: Dict[str, Any] = {}
+        read_run_metrics = getattr(application.state.metrics_store, "get_run_metrics", None)
+        for window_type in ("tumbling", "sliding"):
+            if not callable(read_run_metrics):
+                window_summaries[window_type] = {
+                    "status": "unavailable",
+                    "reason": "Run-scoped window summary storage is not available.",
+                    "metrics": None,
+                }
+                continue
+            try:
+                summary = await asyncio.wait_for(
+                    read_run_metrics(str(run_id), window_type),
+                    timeout=MEASUREMENT_STORAGE_OPERATION_TIMEOUT_SECONDS,
+                )
+                if summary is None:
+                    window_summaries[window_type] = {
+                        "status": "not_persisted", "reason": None, "metrics": None,
+                    }
+                else:
+                    metrics = {
+                        "count": summary.count,
+                        "total": summary.total,
+                        "average": summary.average,
+                        "minimum": summary.minimum,
+                        "maximum": summary.maximum,
+                    }
+                    if (not isinstance(metrics["count"], int) or metrics["count"] < 0
+                            or any(not math.isfinite(value) for value in metrics.values()
+                                   if value is not None and isinstance(value, (int, float)))
+                            or any(value is not None and not isinstance(value, (int, float))
+                                   for key, value in metrics.items() if key != "count")
+                            or any(value is None for key, value in metrics.items()
+                                   if key in {"count", "total"})):
+                        raise ValueError("Stored run metrics are invalid")
+                    window_summaries[window_type] = {
+                        "status": "available",
+                        "reason": None,
+                        "metrics": metrics,
+                    }
+            except Exception:
+                logger.warning(
+                    "Run-scoped %s window summary unavailable for run %s",
+                    window_type, run_id,
+                )
+                window_summaries[window_type] = {
+                    "status": "unavailable",
+                    "reason": "Redis could not read or decode this run-scoped summary.",
+                    "metrics": None,
+                }
+        return {
+            "run_id": run["run_id"],
+            "results": run["results"],
+            "window_summaries": window_summaries,
+        }
 
     @application.get("/api/experiments/{experiment_id}/runs/{run_id}/execution")
     async def get_run_execution_progress(experiment_id: UUID, run_id: UUID) -> Dict[str, Any]:

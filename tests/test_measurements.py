@@ -228,6 +228,9 @@ class _AtomicPipeline:
         await asyncio.sleep(0)
         return [self.client.strings.get(key) for key in keys]
 
+    async def get(self, key):
+        return self.client.strings.get(key)
+
     def multi(self):
         return None
 
@@ -299,6 +302,9 @@ class _AtomicRedis(_Redis):
                 self.expiries.pop(key, None)
             self.versions[key] = self.versions.get(key, 0) + 1
         return True
+
+    async def get(self, key):
+        return self.strings.get(key)
 
     def pipeline(self, transaction=True):
         return _AtomicPipeline(self)

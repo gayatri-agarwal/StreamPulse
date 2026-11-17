@@ -27,6 +27,8 @@ class LibraryEvent:
     timestamp: datetime
     value: Optional[float] = None
     run_id: Optional[str] = None
+    simulation_id: Optional[str] = None
+    published_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
         for field_name in ("event_id", "student_id", "book_id"):
@@ -59,6 +61,26 @@ class LibraryEvent:
                 raise ValueError("run_id must be a valid UUID") from exc
             object.__setattr__(self, "run_id", normalized_run_id)
 
+        if self.simulation_id is not None:
+            try:
+                normalized_simulation_id = str(UUID(self.simulation_id))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("simulation_id must be a valid UUID") from exc
+            object.__setattr__(self, "simulation_id", normalized_simulation_id)
+        if self.run_id is not None and self.simulation_id is not None:
+            raise ValueError("run_id and simulation_id cannot both be set")
+
+        if self.published_at is not None:
+            published_at = self.published_at
+            if isinstance(published_at, str):
+                try:
+                    published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError("published_at must be a valid ISO 8601 timestamp") from exc
+            if not isinstance(published_at, datetime) or published_at.tzinfo is None:
+                raise ValueError("published_at must be timezone-aware")
+            object.__setattr__(self, "published_at", published_at)
+
         if self.value is None:
             return
         if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
@@ -71,7 +93,7 @@ class LibraryEvent:
     def from_mapping(cls, data: Mapping[str, Any]) -> "LibraryEvent":
         """Build an event from a mapping, rejecting missing or extra fields."""
         expected = {"event_id", "event_type", "student_id", "book_id", "timestamp"}
-        allowed = expected | {"value", "run_id"}  # Legacy publishers may still send a value; consumers replace it.
+        allowed = expected | {"value", "run_id", "simulation_id", "published_at"}  # Legacy publishers may still send a value; consumers replace it.
         if not isinstance(data, Mapping):
             raise ValueError("event data must be a mapping")
         missing = expected - data.keys()

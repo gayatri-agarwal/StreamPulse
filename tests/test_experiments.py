@@ -67,6 +67,19 @@ def create_experiment(client, *, name="Window run", configuration=None):
     return response.json()
 
 
+def test_api_startup_logs_actual_resolved_repository_path(tmp_path, caplog):
+    database_path = tmp_path / "api-startup.sqlite3"
+    caplog.set_level("INFO", logger="app.main")
+
+    with TestClient(create_app(experiment_db_path=database_path)):
+        pass
+
+    assert (
+        "experiment_repository_initialized component=api "
+        f"database_path={database_path.resolve()}"
+    ) in caplog.text
+
+
 def create_run(client, experiment_id, **body):
     response = client.post(f"/api/experiments/{experiment_id}/runs", json=body)
     assert response.status_code == 201, response.text
@@ -883,6 +896,78 @@ def test_completed_run_result_uses_unique_successes_and_run_duration(tmp_path, m
     assert completed["results"]["result_complete"] is True
     assert result.json()["results"] == completed["results"]
     assert completed["results"]["latency_complete"] is True
+
+
+def test_results_api_returns_only_requested_run_window_summaries(tmp_path):
+    from app.processing.metrics import Metrics
+
+    class RunWindowStore(MeasurementStore):
+        def __init__(self):
+            super().__init__(measurement_summary())
+            self.run_summaries = {}
+            self.requested = []
+
+        async def get_run_metrics(self, run_id, window_type):
+            self.requested.append((run_id, window_type))
+            return self.run_summaries.get((run_id, window_type))
+
+    store = RunWindowStore()
+    with TestClient(create_app(metrics_store=store, experiment_db_path=tmp_path / "window-results.sqlite3")) as client:
+        experiment = create_experiment(client)
+        experiment_id = experiment["experiment_id"]
+        run = create_run(client, experiment_id, workload_configuration={"target_event_count": 1})
+        url = f"/api/experiments/{experiment_id}/runs/{run['run_id']}"
+        client.post(f"{url}/start")
+        record_successful_workload(client, experiment_id, run["run_id"])
+        finalize_requested_run(client, experiment_id, run["run_id"])
+        store.run_summaries[(run["run_id"], "tumbling")] = Metrics(8, 36.0, 4.5, 1.0, 8.0)
+        response = client.get(f"{url}/results")
+        other_experiment = create_experiment(client, name="Other experiment")
+        wrong_parent = client.get(
+            f"/api/experiments/{other_experiment['experiment_id']}/runs/{run['run_id']}/results"
+        )
+
+    assert response.status_code == 200
+    assert response.json()["window_summaries"] == {
+        "tumbling": {
+            "status": "available", "reason": None,
+            "metrics": {"count": 8, "total": 36.0, "average": 4.5, "minimum": 1.0, "maximum": 8.0},
+        },
+        "sliding": {"status": "not_persisted", "reason": None, "metrics": None},
+    }
+    assert set(store.requested) == {
+        (run["run_id"], "tumbling"), (run["run_id"], "sliding"),
+    }
+    assert wrong_parent.status_code == 404
+
+
+def test_results_api_isolates_window_summary_redis_errors(tmp_path):
+    from app.processing.metrics import Metrics
+
+    class FailingRunWindowStore(MeasurementStore):
+        async def get_run_metrics(self, run_id, window_type):
+            if window_type == "sliding":
+                return Metrics(2, float("nan"), float("nan"), None, None)
+            raise RuntimeError("Redis read or decode failed")
+
+    store = FailingRunWindowStore(measurement_summary())
+    with TestClient(create_app(metrics_store=store, experiment_db_path=tmp_path / "window-errors.sqlite3")) as client:
+        experiment = create_experiment(client)
+        experiment_id = experiment["experiment_id"]
+        run = create_run(client, experiment_id, workload_configuration={"target_event_count": 1})
+        url = f"/api/experiments/{experiment_id}/runs/{run['run_id']}"
+        client.post(f"{url}/start")
+        record_successful_workload(client, experiment_id, run["run_id"])
+        finalized = finalize_requested_run(client, experiment_id, run["run_id"])
+        response = client.get(f"{url}/results")
+
+    assert response.status_code == 200
+    assert response.json()["results"] == finalized["results"]
+    assert all(
+        summary["status"] == "unavailable" and summary["metrics"] is None
+        and "Redis" in summary["reason"]
+        for summary in response.json()["window_summaries"].values()
+    )
 
 
 def test_zero_duration_and_missing_measurements_are_incomplete(tmp_path, monkeypatch):

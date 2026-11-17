@@ -1,6 +1,7 @@
 """RabbitMQ publisher and asynchronous consumer for library events."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -11,7 +12,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import unquote, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aio_pika
 from aiormq import spec as aiormq_spec
@@ -23,6 +24,8 @@ from app.experiments.store import (
     ExperimentRepository, InvalidRunConfiguration, RunNotFound,
 )
 from app.processing.run_processor_manager import RunProcessorManager
+from app.processing.simulation_processor_manager import SimulationProcessorManager
+from app.safe_diagnostics import safe_exception_details
 from app.storage.redis_metrics import (
     ConsumerMonitoringSnapshot,
     MEASUREMENT_STORAGE_OPERATION_TIMEOUT_SECONDS,
@@ -65,6 +68,19 @@ class RabbitMQSettings:
     url: str
     queue: str = "streampulse.events"
 
+    @property
+    def connection_identity(self) -> str:
+        """Return the broker endpoint and vhost without exposing URL credentials."""
+        parsed = urlsplit(self.url)
+        scheme = parsed.scheme.lower()
+        default_port = 5671 if scheme in {"amqps", "amqpss"} else 5672
+        host = parsed.hostname or "unknown"
+        port = parsed.port or default_port
+        virtual_host = unquote(parsed.path.lstrip("/")) or "/"
+        if any(character.isspace() for character in virtual_host):
+            virtual_host = "<nonstandard>"
+        return f"{host}:{port}/{virtual_host}"
+
     @classmethod
     def from_env(cls) -> "RabbitMQSettings":
         url = os.getenv("RABBITMQ_URL", "").strip()
@@ -86,6 +102,8 @@ def _event_json(event: LibraryEvent) -> bytes:
         "timestamp": event.timestamp.isoformat(),
         "value": event.value,
         **({"run_id": event.run_id} if event.run_id is not None else {}),
+        **({"simulation_id": event.simulation_id} if event.simulation_id is not None else {}),
+        **({"published_at": event.published_at.isoformat()} if event.published_at is not None else {}),
     }, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
@@ -258,18 +276,73 @@ class RabbitMQConsumer:
         self.processed_since_start = 0
         self.processing_failures_since_start = 0
         self.monitoring_failures_since_start = 0
-        self._consumer_instance_id = str(uuid4())
-        self._last_completed_tumbling_at: Optional[str] = None
         self._monitoring_store = getattr(processor, "metrics_store", None)
+        configured_instance_id = getattr(self._monitoring_store, "consumer_instance_id", None)
+        try:
+            self._consumer_instance_id = str(uuid4()) if configured_instance_id is None else str(UUID(configured_instance_id))
+        except (TypeError, ValueError, AttributeError):
+            self._consumer_instance_id = str(uuid4())
+        self._last_completed_tumbling_at: Optional[str] = None
         self._experiment_repository = experiment_repository
         self._run_processor_manager = (
             RunProcessorManager(experiment_repository, self._monitoring_store)
             if experiment_repository is not None else None
         )
+        self._simulation_processor_manager = (
+            SimulationProcessorManager(self._monitoring_store)
+            if callable(getattr(self._monitoring_store, "read_simulation_configuration", None))
+            else None
+        )
         self._run_processor_cleanup_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._heartbeat_refresh_requested = asyncio.Event()
         self._monitoring_started = False
+
+    @staticmethod
+    def _diagnostic_value(value: Any, *, allowed: str = "-_.:") -> str:
+        """Keep identifiers and queue labels bounded and safe for one-line logs."""
+        if not isinstance(value, str):
+            return "-"
+        value = value.strip()
+        if not value or len(value) > 96 or any(
+            not (character.isalnum() or character in allowed) for character in value
+        ):
+            return "-"
+        return value
+
+    def _log_rejection(
+        self,
+        reason_code: str,
+        *,
+        run_id: Optional[str] = None,
+        simulation_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        requeue: bool,
+        explanation: str,
+    ) -> None:
+        logger.warning(
+            "consumer_rejection instance_id=%s reason_code=%s run_id=%s event_id=%s simulation_id=%s queue=%s "
+            "requeue=%s explanation=%s",
+            self._diagnostic_value(self._consumer_instance_id),
+            reason_code,
+            self._diagnostic_value(run_id),
+            self._diagnostic_value(event_id),
+            self._diagnostic_value(simulation_id),
+            self._diagnostic_value(getattr(self.settings, "queue", None), allowed="-_.:/"),
+            str(requeue).lower(),
+            explanation,
+        )
+
+    @staticmethod
+    def _message_identifiers_for_log(message: Any) -> tuple[Optional[str], Optional[str]]:
+        """Extract only bounded ID fields; never include the serialized body in logs."""
+        try:
+            payload = json.loads(message.body.decode("utf-8"))
+        except Exception:
+            return None, None
+        if not isinstance(payload, dict):
+            return None, None
+        return payload.get("run_id") or payload.get("simulation_id"), payload.get("event_id")
 
     def _make_monitoring_snapshot(self, consumer_state: str) -> ConsumerMonitoringSnapshot:
         processor = self.processor
@@ -357,15 +430,19 @@ class RabbitMQConsumer:
             self.monitoring_failures_since_start += 1
             logger.warning("Could not record consumer shutdown state; continuing cleanup.")
 
-    async def _record_measurements(self, *, run_id: Optional[str], counters: dict,
+    async def _record_measurements(self, *, run_id: Optional[str], simulation_id: Optional[str] = None, counters: dict,
                                    samples: dict, success_timestamp: Optional[float] = None) -> None:
         recorder = getattr(self._monitoring_store, "record_measurements", None)
         if not callable(recorder):
             return
         try:
             await asyncio.wait_for(
-                recorder(run_id=run_id, counters=counters, samples=samples,
-                         success_timestamp=success_timestamp),
+                recorder(**({"run_id": run_id, "counters": counters, "samples": samples,
+                             "success_timestamp": success_timestamp}
+                            if simulation_id is None else
+                            {"run_id": None, "simulation_id": simulation_id,
+                             "counters": counters, "samples": samples,
+                             "success_timestamp": success_timestamp})),
                 timeout=MEASUREMENT_STORAGE_OPERATION_TIMEOUT_SECONDS,
             )
         except Exception:
@@ -380,6 +457,7 @@ class RabbitMQConsumer:
                 await asyncio.wait_for(
                     recorder(
                         run_id=event.run_id,
+                        **({"simulation_id": event.simulation_id} if event.simulation_id is not None else {}),
                         event_id=event.event_id,
                         succeeded=succeeded,
                         samples=samples,
@@ -395,16 +473,45 @@ class RabbitMQConsumer:
         counters["consumer_successes" if succeeded else "consumer_failures"] = 1
         await self._record_measurements(
             run_id=event.run_id,
+            simulation_id=event.simulation_id,
             counters=counters,
             samples=samples,
             success_timestamp=success_timestamp,
         )
+
+    async def _record_simulation_activity(
+        self, event: LibraryEvent, *, status: str,
+        processed_at: Optional[str] = None, processing_error: Optional[str] = None,
+    ) -> None:
+        if event.simulation_id is None:
+            return
+        recorder = getattr(self._monitoring_store, "record_simulation_activity", None)
+        if not callable(recorder):
+            return
+        try:
+            await asyncio.wait_for(
+                recorder(
+                    event.simulation_id, event.event_id, event.timestamp.isoformat(),
+                    event.published_at.isoformat() if event.published_at else None,
+                    processed_at, status, processing_error,
+                ),
+                timeout=MEASUREMENT_STORAGE_OPERATION_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning("Could not persist simulation activity outcome.")
 
     async def _claim_run_event(self, event: LibraryEvent, message: Any) -> bool:
         if event.run_id is None:
             return True
         if self._experiment_repository is None:
             logger.warning("Run-scoped event accounting is not configured; message will be retried.")
+            self._log_rejection(
+                "reservation_repository_unavailable",
+                run_id=event.run_id,
+                event_id=event.event_id,
+                requeue=True,
+                explanation="Run-scoped reservation repository is not configured.",
+            )
             await message.reject(requeue=True)
             return False
         try:
@@ -415,10 +522,24 @@ class RabbitMQConsumer:
             )
         except Exception:
             logger.warning("Could not verify run event reservation; message will be retried.")
+            self._log_rejection(
+                "reservation_claim_failed",
+                run_id=event.run_id,
+                event_id=event.event_id,
+                requeue=True,
+                explanation="Reservation lookup raised an exception.",
+            )
             await message.reject(requeue=True)
             return False
         if not claimed:
             # The event was rejected at publish time or is not part of an accepted run.
+            self._log_rejection(
+                "reservation_claim_returned_false",
+                run_id=event.run_id,
+                event_id=event.event_id,
+                requeue=False,
+                explanation="Repository returned false without a more specific claim reason.",
+            )
             await message.reject(requeue=False)
             return False
         return True
@@ -495,6 +616,14 @@ class RabbitMQConsumer:
             if self._draining:
                 # A delivery already dispatched during Basic.Cancel is returned
                 # to RabbitMQ without touching processor or receipt state.
+                run_id, event_id = self._message_identifiers_for_log(message)
+                self._log_rejection(
+                    "consumer_draining",
+                    run_id=run_id,
+                    event_id=event_id,
+                    requeue=True,
+                    explanation="Consumer is draining; delivery is returned without processing.",
+                )
                 await message.reject(requeue=True)
                 return
             await self._handle_message(message)
@@ -510,10 +639,46 @@ class RabbitMQConsumer:
         started_at_ns = time.perf_counter_ns()
         decode_started_at = time.perf_counter()
         delivered_at = datetime.now(timezone.utc)
+        record_delivery = getattr(self._monitoring_store, "record_active_consumer_delivery", None)
+        if callable(record_delivery):
+            try:
+                await asyncio.wait_for(
+                    record_delivery(self._consumer_instance_id),
+                    timeout=MONITORING_STORAGE_OPERATION_TIMEOUT_SECONDS,
+                )
+                self._heartbeat_refresh_requested.set()
+            except Exception as exc:
+                logger.warning(
+                    "consumer_delivery_ownership_unavailable queue=%s instance_id=%s exception_type=%s",
+                    self._diagnostic_value(self.settings.queue, allowed="-_.:/"),
+                    self._diagnostic_value(self._consumer_instance_id),
+                    type(exc).__name__,
+                )
         try:
             payload = json.loads(message.body.decode("utf-8"))
-            event = LibraryEvent.from_mapping(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            self._log_rejection(
+                "invalid_json",
+                requeue=False,
+                explanation="Delivery body is not valid UTF-8 JSON.",
+            )
+            await self._record_measurements(
+                run_id=None,
+                counters={"consumer_attempts": 1, "consumer_failures": 1},
+                samples={},
+            )
+            await message.reject(requeue=False)
+            return
+        try:
+            event = LibraryEvent.from_mapping(payload)
+        except (TypeError, ValueError):
+            self._log_rejection(
+                "invalid_event_schema",
+                run_id=payload.get("run_id") if isinstance(payload, dict) else None,
+                event_id=payload.get("event_id") if isinstance(payload, dict) else None,
+                requeue=False,
+                explanation="JSON payload does not satisfy the event schema.",
+            )
             await self._record_measurements(
                 run_id=None,
                 counters={"consumer_attempts": 1, "consumer_failures": 1},
@@ -528,6 +693,13 @@ class RabbitMQConsumer:
         if event.run_id is not None:
             if self._run_processor_manager is None:
                 logger.warning("Run-scoped event processing is not configured; message will be retried.")
+                self._log_rejection(
+                    "run_processor_unavailable",
+                    run_id=event.run_id,
+                    event_id=event.event_id,
+                    requeue=True,
+                    explanation="Run-scoped processor manager is not configured.",
+                )
                 await message.reject(requeue=True)
                 return
             lookup_started = time.perf_counter()
@@ -540,18 +712,53 @@ class RabbitMQConsumer:
                 # confirming its durable reservation below.
                 run_configuration_error = exc
             except RunNotFound:
+                self._log_rejection(
+                    "run_not_found",
+                    run_id=event.run_id,
+                    event_id=event.event_id,
+                    requeue=False,
+                    explanation="Consumer repository has no matching run configuration.",
+                )
                 await message.reject(requeue=False)
                 return
-            except Exception:
+            except Exception as exc:
                 logger.warning("Could not load run configuration; message will be retried.")
+                self._log_rejection(
+                    "configuration_lookup_failed",
+                    run_id=event.run_id,
+                    event_id=event.event_id,
+                    requeue=True,
+                    explanation=f"Configuration lookup raised {type(exc).__name__}.",
+                )
                 await message.reject(requeue=True)
                 return
             configuration_lookup_ms = (time.perf_counter() - lookup_started) * 1000.0
         if not await self._claim_run_event(event, message):
             return
+        simulation_processor = None
+        if event.simulation_id is not None:
+            if self._simulation_processor_manager is None:
+                self._log_rejection(
+                    "simulation_processor_unavailable", simulation_id=event.simulation_id,
+                    event_id=event.event_id, requeue=True,
+                    explanation="Simulation-scoped processor manager is not configured.",
+                )
+                await message.reject(requeue=True)
+                return
+            try:
+                simulation_processor = await self._simulation_processor_manager.acquire(event.simulation_id)
+            except Exception as exc:
+                logger.warning("Could not load simulation configuration; message will be retried.")
+                self._log_rejection(
+                    "simulation_configuration_unavailable", simulation_id=event.simulation_id,
+                    event_id=event.event_id, requeue=True,
+                    explanation=f"Configuration lookup raised {type(exc).__name__}.",
+                )
+                await message.reject(requeue=True)
+                return
         publish_to_delivery_ms = None
         try:
-            event_timestamp = event.timestamp
+            event_timestamp = event.published_at or event.timestamp
             if event_timestamp.tzinfo is not None:
                 elapsed = (delivered_at - event_timestamp).total_seconds() * 1000.0
                 publish_to_delivery_ms = elapsed if elapsed >= 0 else None
@@ -564,7 +771,9 @@ class RabbitMQConsumer:
             (time.perf_counter() - decode_started_at) * 1000.0 - configuration_lookup_ms,
         )
         event = replace(event, value=decode_latency_ms)
-        processor = self.processor if event.run_id is None else None
+        processor = simulation_processor if event.simulation_id is not None else (
+            self.processor if event.run_id is None else None
+        )
         leased_run_processor = False
         try:
             try:
@@ -576,8 +785,19 @@ class RabbitMQConsumer:
                     )
                     leased_run_processor = True
                 processing_result = await processor.process(event)
-            except Exception:
+            except Exception as exc:
                 self.processing_failures_since_start += 1
+                self._heartbeat_refresh_requested.set()
+                exception_details, formatted_traceback = safe_exception_details(exc)
+                logger.error(
+                    "consumer_processing_failed instance_id=%s queue=%s run_id=%s event_id=%s "
+                    "stage=processor.process exception_class=%s exception_details=%s traceback=%s",
+                    self._diagnostic_value(self._consumer_instance_id),
+                    self._diagnostic_value(self.settings.queue, allowed="-_.:/"),
+                    self._diagnostic_value(event.run_id),
+                    self._diagnostic_value(event.event_id),
+                    type(exc).__name__, exception_details, formatted_traceback,
+                )
                 if getattr(self._monitoring_store, "aggregation_write_status", None) == "unavailable":
                     self._heartbeat_refresh_requested.set()
                 processing_ms = (time.perf_counter_ns() - started_at_ns) / 1_000_000.0
@@ -591,6 +811,11 @@ class RabbitMQConsumer:
                         "consumer_processing_latency_ms": processing_ms,
                         "redis_persistence_latency_ms": persistence_ms,
                     },
+                )
+                await self._record_simulation_activity(
+                    event,
+                    status="processing_failed",
+                    processing_error=type(exc).__name__,
                 )
                 if not await self._settle_run_event(event, succeeded=False):
                     await message.reject(requeue=True)
@@ -616,6 +841,11 @@ class RabbitMQConsumer:
                 },
                 success_timestamp=datetime.now(timezone.utc).timestamp(),
             )
+            await self._record_simulation_activity(
+                event,
+                status="processed",
+                processed_at=datetime.now(timezone.utc).isoformat(),
+            )
             if not await self._settle_run_event(event, succeeded=True):
                 await message.reject(requeue=True)
                 return
@@ -629,6 +859,13 @@ class RabbitMQConsumer:
             if isinstance(processing_result, dict) and "tumbling" in processing_result:
                 self._last_completed_tumbling_at = datetime.now(timezone.utc).isoformat()
             await message.ack()
+            logger.debug(
+                "consumer_event_acknowledged instance_id=%s queue=%s run_id=%s event_id=%s",
+                self._diagnostic_value(self._consumer_instance_id),
+                self._diagnostic_value(self.settings.queue, allowed="-_.:/"),
+                self._diagnostic_value(event.run_id),
+                self._diagnostic_value(event.event_id),
+            )
         finally:
             if leased_run_processor:
                 await self._release_processor_lease(
@@ -642,6 +879,10 @@ class RabbitMQConsumer:
         try:
             if self._experiment_repository is not None:
                 await asyncio.to_thread(self._experiment_repository.initialize)
+                logger.info(
+                    "experiment_repository_initialized component=consumer database_path=%s",
+                    self._experiment_repository.database_path.resolve(),
+                )
             self._connection = await self._connect(self.settings.url)
             self._channel = await self._connection.channel()
             await self._channel.set_qos(prefetch_count=1)
@@ -652,13 +893,27 @@ class RabbitMQConsumer:
             )
             self._consumer_tag = await queue.consume(self.handle_message)
             self._queue = queue
+            logger.info(
+                "consumer_subscription_established instance_id=%s queue=%s rabbitmq_target=%s rabbitmq_fingerprint=%s redis_target=%s",
+                self._diagnostic_value(self._consumer_instance_id),
+                self._diagnostic_value(self.settings.queue, allowed="-_.:/"),
+            self._diagnostic_value(self.settings.connection_identity, allowed="-_.:/%"),
+                hashlib.sha256(self.settings.url.encode("utf-8")).hexdigest()[:12],
+            getattr(self._monitoring_store, "connection_identity", None) or "unavailable",
+            )
             self._start_heartbeat()
             if self._run_processor_manager is not None:
                 self._run_processor_cleanup_task = asyncio.create_task(
                     self._run_processor_cleanup_loop()
                 )
-        except Exception:
+        except Exception as exc:
             await self.close()
+            logger.error(
+                "consumer_start_failed queue=%s rabbitmq_fingerprint=%s exception_type=%s",
+                self._diagnostic_value(getattr(self.settings, "queue", None), allowed="-_.:/"),
+                hashlib.sha256(self.settings.url.encode("utf-8")).hexdigest()[:12],
+                type(exc).__name__,
+            )
             raise RabbitMQError("Could not start RabbitMQ consumer") from None
 
     async def run_forever(self) -> None:

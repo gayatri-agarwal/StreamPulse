@@ -1,7 +1,5 @@
 """Run the StreamPulse RabbitMQ consumer as a separate process."""
 from dotenv import load_dotenv
-
-load_dotenv()
 import asyncio
 import logging
 from pathlib import Path
