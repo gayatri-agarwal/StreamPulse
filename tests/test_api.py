@@ -52,8 +52,9 @@ def test_frontend_root_and_static_assets_are_served():
         script = client.get("/static/app.js")
 
     assert page.status_code == 200
-    assert 'href="styles.css?v=window-config-1"' in page.text
-    assert 'src="app.js?v=window-config-1"' in page.text
+    assert 'href="styles.css?v=window-membership-1"' in page.text
+    assert 'src="app.js?v=window-membership-1"' in page.text
+    assert 'class="window-legend"' in page.text
     assert 'id="window-config-form"' in page.text
     assert 'id="pending-window-config"' in page.text
     assert "Experiments" not in page.text

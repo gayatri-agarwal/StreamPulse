@@ -186,17 +186,43 @@ class SimulationEngine:
         session = self._public_session()
         events = session["recent_events"] if session else []
         processed = {}
+        window_membership = None
         if session is not None:
             try:
                 processed = {item["event_id"]: item for item in
                              await self._metrics_store.get_simulation_activity(session["simulation_id"])}
             except Exception:
                 pass
+            try:
+                checkpoint_reader = getattr(self._metrics_store, "load_processing_checkpoint", None)
+                configuration_reader = getattr(self._metrics_store, "read_active_configuration", None)
+                if callable(checkpoint_reader) and callable(configuration_reader):
+                    checkpoint = await checkpoint_reader(simulation_id=session["simulation_id"])
+                    active = await configuration_reader()
+                    checkpoint_configuration = (
+                        checkpoint.get("tumbling_size"), checkpoint.get("sliding_size"),
+                        checkpoint.get("sliding_interval"),
+                    )
+                    active_configuration = (
+                        (active.tumbling_size, active.sliding_size, active.sliding_interval)
+                        if active is not None else None
+                    )
+                    if checkpoint.get("version") == 0:
+                        window_membership = {"tumbling": [], "sliding": []}
+                    elif checkpoint_configuration == active_configuration:
+                        window_membership = {
+                            "tumbling": [event.get("event_id") for event in checkpoint["tumbling"]],
+                            "sliding": [event.get("event_id")
+                                        for event in checkpoint["sliding"]["events"]],
+                        }
+            except Exception:
+                pass
         for event in events:
             if event["event_id"] in processed:
                 event.update(processed[event["event_id"]])
         return {"simulation_id": session["simulation_id"] if session else None,
-                "events": events, "count": len(events)}
+                "events": events, "count": len(events),
+                "window_membership": window_membership}
 
     async def _run(self, config: SimulationStart) -> None:
         count = 0

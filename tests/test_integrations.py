@@ -2106,6 +2106,39 @@ async def test_simulation_engine_consumer_and_status_share_simulation_scoped_sum
 
 
 @pytest.mark.asyncio
+async def test_simulation_activity_exposes_actual_window_member_event_ids():
+    store = RedisMetricsStore(client=FakeRedis())
+    await store.record_active_consumer_delivery(store.consumer_instance_id)
+    configuration = WindowConfiguration(5, 5, 1)
+    await store.initialize_active_configuration(configuration)
+    simulation_id = str(uuid4())
+    processor = LibraryEventProcessor(
+        TumblingWindow(5), SlidingWindow(5), store, configuration,
+        simulation_id=simulation_id,
+    )
+    events = [LibraryEvent(
+        event_id=f"membership-{index}", event_type="BOOK_ISSUED",
+        student_id="student-1", book_id="book-1",
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        value=index, simulation_id=simulation_id,
+    ) for index in range(1, 7)]
+    for event in events:
+        await processor.process(event)
+
+    engine = SimulationEngine(store, lambda _event: None)
+    engine._session = {
+        "simulation_id": simulation_id,
+        "recent_events": [{"event_id": event.event_id} for event in events],
+    }
+    activity = await engine.activity()
+
+    assert activity["window_membership"] == {
+        "tumbling": ["membership-6"],
+        "sliding": [f"membership-{index}" for index in range(2, 7)],
+    }
+
+
+@pytest.mark.asyncio
 async def test_distinct_run_processors_write_only_to_their_own_summary_namespaces():
     client = FakeRedis()
     store = RedisMetricsStore(client=client)

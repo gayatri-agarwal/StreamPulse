@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#eef2f5">
   <meta name="description" content="An interactive laboratory for observing streaming event flows, queues, consumers, and event-count windows.">
   <title>StreamPulse | Interactive Streaming Systems Lab</title>
-  <link rel="stylesheet" href="styles.css?v=window-config-1">
+  <link rel="stylesheet" href="styles.css?v=window-membership-1">
 </head>
 <body>
   <header class="app-header">
@@ -100,6 +100,7 @@
     <section class="panel activity-panel" aria-labelledby="activity-heading">
       <div class="section-heading"><div><p class="kicker">03 · LIVE EVENT ACTIVITY</p><h2 id="activity-heading">Arrival and processing timeline</h2></div><span id="activity-count" class="subtle-label">No simulation activity</span></div>
       <p class="section-intro">Rows follow publish order. “Processed” appears only after the consumer records a completion timestamp.</p>
+      <div class="window-legend" aria-label="Active window membership"><span><i class="tumbling-window" aria-hidden="true"></i>Tumbling Window</span><span><i class="sliding-window" aria-hidden="true"></i>Sliding Window</span></div>
       <div id="activity-message" class="table-state" role="status" aria-live="polite">Start a simulation to see generated events.</div>
       <div class="table-scroll"><table class="activity-table"><thead><tr><th>Event</th><th>Type</th><th>Status</th><th><span class="time-heading event-time-heading">Event time</span></th><th><span class="time-heading publish-time-heading">Published</span></th><th><span class="time-heading process-time-heading">Processed</span></th></tr></thead><tbody id="activity-body"></tbody></table></div>
       <p id="late-limitation" class="limitation-note" hidden><strong>Late-arrival model:</strong> timestamps may be out of order, but the consumer still feeds events to event-count windows in RabbitMQ arrival order. Windows are not reopened.</p>
@@ -234,6 +235,6 @@
     <footer class="page-footer"><a href="/">← Return to Streaming Lab</a><span>Refreshes from the existing API every 5 seconds while this view is open</span></footer>
   </main>
 
-  <script src="app.js?v=window-config-1"></script>
+  <script src="app.js?v=window-membership-1"></script>
 </body>
 </html>

@@ -651,6 +651,9 @@ function renderActivity() {
   const records = Array.isArray(activity.events) ? [...activity.events] : [];
   records.sort((a, b) => new Date(a.published_at || 0) - new Date(b.published_at || 0));
   const visible = records.slice(-30);
+  const windowMembership = activity.window_membership;
+  const tumblingEventIds = new Set(windowMembership?.tumbling || []);
+  const slidingEventIds = new Set(windowMembership?.sliding || []);
   elements.activityCount.textContent = records.length
     ? `Showing ${visible.length} of ${activity.count ?? records.length} recent generated events`
     : "No events generated";
@@ -669,6 +672,18 @@ function renderActivity() {
     id.title = event.event_id || "";
     eventCell.textContent = "";
     eventCell.append(id);
+    if (tumblingEventIds.has(event.event_id)) {
+      const label = document.createElement("span");
+      label.className = "window-membership-label tumbling-window";
+      label.textContent = "Tumbling";
+      eventCell.append(label);
+    }
+    if (slidingEventIds.has(event.event_id)) {
+      const label = document.createElement("span");
+      label.className = "window-membership-label sliding-window";
+      label.textContent = "Sliding";
+      eventCell.append(label);
+    }
     const eventTimestamp = eventTimeOf(event);
     const eventMs = eventTimestamp ? new Date(eventTimestamp).getTime() : NaN;
     const isOutOfOrder = Number.isFinite(eventMs) && previousEventTimestamp !== null && eventMs < previousEventTimestamp;
