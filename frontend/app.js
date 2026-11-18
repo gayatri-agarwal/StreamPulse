@@ -54,6 +54,7 @@ const elements = {
   monitoringUpdated: document.getElementById("monitoring-updated"),
   queueReady: document.getElementById("queue-ready"),
   queueName: document.getElementById("queue-name"),
+  queueUnacknowledged: document.getElementById("queue-unacknowledged"),
   consumerCount: document.getElementById("consumer-count"),
   consumerState: document.getElementById("consumer-state"),
   processedCount: document.getElementById("processed-count"),
@@ -93,6 +94,13 @@ const elements = {
   currentWindowCountEmpty: document.getElementById("current-window-count-empty"),
   currentWindowValueChart: document.getElementById("current-window-value-chart"),
   currentWindowValueEmpty: document.getElementById("current-window-value-empty"),
+  activeWindowConfig: document.getElementById("active-window-config"),
+  pendingWindowConfig: document.getElementById("pending-window-config"),
+  windowConfigForm: document.getElementById("window-config-form"),
+  configTumblingSize: document.getElementById("config-tumbling-size"),
+  configSlidingSize: document.getElementById("config-sliding-size"),
+  configSlidingInterval: document.getElementById("config-sliding-interval"),
+  windowConfigFeedback: document.getElementById("window-config-feedback"),
 };
 
 let selectedMode = "steady";
@@ -105,6 +113,7 @@ let currentSimulationData = null;
 const graphTrendHistory = { tumbling: [], sliding: [] };
 const graphTrendMarkers = { tumbling: null, sliding: null };
 let monitoring = null;
+let windowConfiguration = null;
 let health = null;
 let pollTimer = null;
 let pollInFlight = false;
@@ -314,6 +323,24 @@ function setText(element, value, suffix = "") {
   element.textContent = value === null || value === undefined ? "Unavailable" : formatValue(value, suffix);
 }
 
+function configurationLabel(configuration) {
+  return configuration
+    ? `Tumbling ${configuration.tumbling_size} · Sliding ${configuration.sliding_size} · Interval ${configuration.sliding_interval}`
+    : "None";
+}
+
+function renderWindowConfiguration() {
+  elements.activeWindowConfig.textContent = configurationLabel(windowConfiguration?.active);
+  elements.pendingWindowConfig.textContent = configurationLabel(windowConfiguration?.pending);
+  const values = windowConfiguration?.pending || windowConfiguration?.active;
+  if (values && !elements.windowConfigForm.contains(document.activeElement)) {
+    elements.configTumblingSize.value = values.tumbling_size;
+    elements.configSlidingSize.value = values.sliding_size;
+    elements.configSlidingInterval.value = values.sliding_interval;
+  }
+  elements.configSlidingInterval.max = String(Number(elements.configSlidingSize.value) - 1);
+}
+
 function renderMonitoring() {
   const queue = simulationStatus?.queue;
   const reportedQueue = monitoring?.rabbitmq;
@@ -323,6 +350,7 @@ function renderMonitoring() {
   setText(elements.queueReady, ready);
   elements.queueName.textContent = qName ? `Queue: ${qName}` : "Queue name unavailable";
   setText(elements.consumerCount, consumers);
+  setText(elements.queueUnacknowledged, reportedQueue?.unacknowledged_messages);
 
   const consumerStatus = monitoring?.consumer?.status || simulationStatus?.consumer?.status;
   elements.consumerState.textContent = consumerStatus
@@ -687,13 +715,13 @@ async function refreshLiveData() {
   if (pollInFlight || currentPage() !== "lab" || document.hidden) return;
   pollInFlight = true;
   pollCount += 1;
-  const shouldReadMonitoring = !monitoring || pollCount % MONITORING_INTERVAL_TICKS === 1;
+  const shouldReadMonitoring = !monitoring || !windowConfiguration || pollCount % MONITORING_INTERVAL_TICKS === 1;
   const tasks = [
     requestJson("/api/simulations/status"),
     requestJson("/api/simulations/activity"),
   ];
   if (shouldReadMonitoring) {
-    tasks.push(requestJson("/api/health"), requestJson("/api/monitoring"));
+    tasks.push(requestJson("/api/health"), requestJson("/api/monitoring"), requestJson("/api/config"));
   }
   try {
     const results = await Promise.allSettled(tasks);
@@ -718,6 +746,14 @@ async function refreshLiveData() {
     if (shouldReadMonitoring) {
       if (results[2]?.status === "fulfilled") health = results[2].value;
       if (results[3]?.status === "fulfilled") monitoring = results[3].value;
+      if (results[4]?.status === "fulfilled") {
+        windowConfiguration = results[4].value;
+        renderWindowConfiguration();
+      } else if (results[4]?.status === "rejected" && !windowConfiguration) {
+        elements.activeWindowConfig.textContent = "Unavailable";
+        elements.windowConfigFeedback.className = "feedback is-error";
+        elements.windowConfigFeedback.textContent = `Could not load configuration: ${results[4].reason?.message || "API request failed."}`;
+      }
       if (results[2]?.status === "rejected" || results[3]?.status === "rejected") {
         if (results[2]?.status === "rejected") health = null;
         if (results[3]?.status === "rejected") monitoring = null;
@@ -845,6 +881,31 @@ elements.modeCards.forEach((card) => card.addEventListener("click", () => {
   renderMode(card.dataset.mode);
   clearSimulationMessage();
 }));
+
+elements.configSlidingSize.addEventListener("change", renderWindowConfiguration);
+elements.windowConfigForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const feedback = elements.windowConfigFeedback;
+  feedback.className = "feedback";
+  feedback.textContent = "Applying configuration…";
+  try {
+    const response = await requestJson("/api/config", {
+      method: "PUT",
+      body: JSON.stringify({
+        tumbling_size: Number(elements.configTumblingSize.value),
+        sliding_size: Number(elements.configSlidingSize.value),
+        sliding_interval: Number(elements.configSlidingInterval.value),
+      }),
+    });
+    windowConfiguration = response;
+    renderWindowConfiguration();
+    feedback.className = "feedback is-success";
+    feedback.textContent = response.message || "Configuration saved and pending activation.";
+  } catch (error) {
+    feedback.className = "feedback is-error";
+    feedback.textContent = `Could not apply configuration: ${error.message}`;
+  }
+});
 
 elements.simulationForm.addEventListener("submit", async (event) => {
   event.preventDefault();

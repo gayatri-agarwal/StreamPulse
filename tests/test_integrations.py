@@ -2302,6 +2302,40 @@ async def test_pending_configuration_waits_for_old_tumbling_boundary_and_activat
 
 
 @pytest.mark.asyncio
+async def test_pending_configuration_activates_at_simulation_tumbling_boundary_after_23_events():
+    store = RedisMetricsStore(client=FakeRedis())
+    old = WindowConfiguration(5, 5, 1)
+    pending = WindowConfiguration(8, 5, 1)
+    simulation_id = str(uuid4())
+    await store.record_active_consumer_delivery(store.consumer_instance_id)
+    await store.initialize_active_configuration(old)
+    await store.save_pending_configuration(pending)
+    processor = LibraryEventProcessor(
+        TumblingWindow(old.tumbling_size),
+        SlidingWindow(old.sliding_size, old.sliding_interval),
+        store,
+        old,
+        simulation_id=simulation_id,
+    )
+
+    results = [
+        await processor.process(make_event(index, f"simulation-{index}"))
+        for index in range(1, 24)
+    ]
+
+    assert results[4]["tumbling"].count == 5
+    assert results[12]["tumbling"].count == 8
+    assert results[20]["tumbling"].count == 8
+    assert await store.read_active_configuration() == pending
+    assert await store.read_pending_configuration() is None
+    assert processor.active_configuration == pending
+    assert processor.tumbling.size == 8
+    assert processor.tumbling.pending_count == 2
+    assert (await store.get_simulation_metrics(simulation_id, "tumbling")).count == 8
+    assert (await store.get_simulation_metrics(simulation_id, "sliding")).count == 5
+
+
+@pytest.mark.asyncio
 async def test_first_events_after_activation_use_new_sizes_and_sliding_interval():
     old = WindowConfiguration(5, 5, 1)
     pending = WindowConfiguration(8, 10, 2)

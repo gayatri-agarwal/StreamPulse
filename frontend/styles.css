@@ -174,6 +174,16 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
 .window-values dd { margin: 4px 0 0; color: var(--ink); font-size: 14px; font-weight: 750; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .window-values div:first-child { grid-column: 1 / -1; }
 .window-footnote { display: block; margin-top: 10px; color: var(--subtle); font-size: 12px; line-height: 1.4; }
+.window-config { margin-top: 18px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
+.window-config h3 { margin: 0; font-size: 17px; }
+.window-config > p { margin: 6px 0 12px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.window-config-state { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0 0 14px; }
+.window-config-state > div { min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: #fff; }
+.window-config-state dt { color: var(--muted); font-size: 12px; font-weight: 700; }
+.window-config-state dd { margin: 4px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+.window-config-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+.window-config-fields select, .window-config-fields input { display: block; width: 100%; min-height: 40px; margin-top: 6px; padding: 7px 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: #fff; color: var(--ink); }
+.window-config .feedback { margin-bottom: 0; }
 .education-panel { margin-bottom: 18px; }
 .concept-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 14px; }
 .concept-card { min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); }
@@ -320,6 +330,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
   .activity-table { min-width: 780px; }
   .monitor-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .latency-grid, .window-results, .concept-grid { grid-template-columns: minmax(0, 1fr); }
+  .window-config-fields, .window-config-state { grid-template-columns: minmax(0, 1fr); }
   .window-result > p { min-height: 0; }
   .failure-analysis-content { grid-template-columns: minmax(0, 1fr); }
   .graph-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }

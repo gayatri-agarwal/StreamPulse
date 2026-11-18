@@ -7,6 +7,11 @@ import logging
 import math
 import os
 import time
+import base64
+import urllib.error
+import urllib.parse
+import urllib.request
+import asyncio
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -171,7 +176,37 @@ class RabbitMQPublisher:
         return {
             "messages_ready": getattr(declaration, "message_count", None),
             "consumer_count": getattr(declaration, "consumer_count", None),
+            "messages_unacknowledged": await self._inspect_unacknowledged(),
         }
+
+    async def _inspect_unacknowledged(self) -> Optional[int]:
+        """Read the queue's unacknowledged count from RabbitMQ's management API."""
+        parsed = urlsplit(self.settings.url)
+        if not parsed.hostname or not parsed.username:
+            return None
+        secure = parsed.scheme.lower() in {"amqps", "amqpss"}
+        scheme, port = ("https", 443) if secure else ("http", 15672)
+        vhost = unquote(parsed.path.lstrip("/")) or "/"
+        path = "/api/queues/{}/{}".format(
+            urllib.parse.quote(vhost, safe=""),
+            urllib.parse.quote(self.settings.queue, safe=""),
+        )
+        url = f"{scheme}://{parsed.hostname}:{port}{path}"
+        credentials = base64.b64encode(
+            f"{unquote(parsed.username)}:{unquote(parsed.password or '')}".encode()
+        ).decode("ascii")
+
+        def read_count() -> Optional[int]:
+            request = urllib.request.Request(url, headers={"Authorization": f"Basic {credentials}"})
+            try:
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    import json
+                    count = json.loads(response.read()).get("messages_unacknowledged")
+                    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+            except Exception:
+                return None
+
+        return await asyncio.to_thread(read_count)
 
     async def publish(self, event: LibraryEvent) -> None:
         if not isinstance(event, LibraryEvent):

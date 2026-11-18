@@ -505,6 +505,7 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
         queue_name = getattr(publisher_settings, "queue", None)
         rabbitmq_status = application.state.rabbitmq_status
         messages_ready = None
+        unacknowledged_messages = None
         consumer_count = None
         counts_observed_at = None
         inspect_queue = getattr(publisher_adapter, "inspect_queue", None)
@@ -515,6 +516,7 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                     rabbitmq_status = "available"
                     application.state.rabbitmq_status = "available"
                     messages_ready = queue_data.get("messages_ready")
+                    unacknowledged_messages = queue_data.get("messages_unacknowledged")
                     consumer_count = queue_data.get("consumer_count")
                     counts_observed_at = datetime.now(timezone.utc).isoformat()
             except Exception:
@@ -601,8 +603,8 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
                 "status": rabbitmq_status,
                 "queue_name": queue_name,
                 "messages_ready": messages_ready,
-                "unacknowledged_messages": None,
-                "unacknowledged_status": "unavailable",
+                "unacknowledged_messages": unacknowledged_messages,
+                "unacknowledged_status": "available" if unacknowledged_messages is not None else "unavailable",
                 "consumer_count": consumer_count,
                 "counts_observed_at": counts_observed_at,
             },

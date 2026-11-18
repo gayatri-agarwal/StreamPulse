@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#eef2f5">
   <meta name="description" content="An interactive laboratory for observing streaming event flows, queues, consumers, and event-count windows.">
   <title>StreamPulse | Interactive Streaming Systems Lab</title>
-  <link rel="stylesheet" href="styles.css?v=graph-analysis-1">
+  <link rel="stylesheet" href="styles.css?v=window-config-1">
 </head>
 <body>
   <header class="app-header">
@@ -114,7 +114,7 @@
           <article class="monitor-card"><span class="monitor-label">Simulation processed</span><strong id="processed-count">Unavailable</strong><small>Unique successful deliveries in this simulation</small></article>
           <article class="monitor-card"><span class="monitor-label">Processing failures</span><strong id="processing-failures">Unavailable</strong><small>Simulation-scoped delivery failures</small></article>
           <article class="monitor-card"><span class="monitor-label">Consumer throughput</span><strong id="throughput">Unavailable</strong><small>Recent unique completion rate</small></article>
-          <article class="monitor-card"><span class="monitor-label">Unacknowledged messages</span><strong>Unavailable</strong><small>Not reported by the current queue inspection</small></article>
+          <article class="monitor-card"><span class="monitor-label">Unacknowledged messages</span><strong id="queue-unacknowledged">Unavailable</strong><small>RabbitMQ deliveries awaiting acknowledgement</small></article>
         </div>
         <div class="latency-grid"><div><span>Publish latency</span><strong id="publish-latency">Unavailable</strong></div><div><span>Consumer processing latency</span><strong id="processing-latency">Unavailable</strong></div></div>
         <p class="metric-note">Latency cards use simulation-scoped samples. Processing counts are separate from publish confirmations and window aggregates.</p>
@@ -126,6 +126,20 @@
           <article class="window-result tumbling-result"><div class="window-title-row"><div><span class="window-kind">TUMBLING</span><h3>Tumbling window</h3></div><span class="window-icon" aria-hidden="true">▰</span></div><p>Fixed, non-overlapping groups. A result appears when a full group completes.</p><dl class="window-values"><div><dt>Events</dt><dd data-window-value="tumbling.count">Unavailable</dd></div><div><dt>Total</dt><dd data-window-value="tumbling.sum">Unavailable</dd></div><div><dt>Average</dt><dd data-window-value="tumbling.average">Unavailable</dd></div><div><dt>Minimum</dt><dd data-window-value="tumbling.minimum">Unavailable</dd></div><div><dt>Maximum</dt><dd data-window-value="tumbling.maximum">Unavailable</dd></div></dl><small class="window-footnote">Window values summarize decode/validation latency (ms).</small></article>
           <article class="window-result sliding-result"><div class="window-title-row"><div><span class="window-kind">SLIDING</span><h3>Sliding window</h3></div><span class="window-icon" aria-hidden="true">▱</span></div><p>Overlapping groups retain the latest configured number of arrivals.</p><dl class="window-values"><div><dt>Events</dt><dd data-window-value="sliding.count">Unavailable</dd></div><div><dt>Total</dt><dd data-window-value="sliding.sum">Unavailable</dd></div><div><dt>Average</dt><dd data-window-value="sliding.average">Unavailable</dd></div><div><dt>Minimum</dt><dd data-window-value="sliding.minimum">Unavailable</dd></div><div><dt>Maximum</dt><dd data-window-value="sliding.maximum">Unavailable</dd></div></dl><small class="window-footnote">Window values summarize decode/validation latency (ms).</small></article>
         </div>
+        <section class="window-config" aria-labelledby="window-config-heading">
+          <h3 id="window-config-heading">Window Configuration</h3>
+          <p>Changes take effect after the current tumbling window completes.</p>
+          <dl class="window-config-state"><div><dt>Active Configuration</dt><dd id="active-window-config">Loading…</dd></div><div><dt>Pending Configuration</dt><dd id="pending-window-config">None</dd></div></dl>
+          <form id="window-config-form">
+            <div class="window-config-fields">
+              <label class="field-label" for="config-tumbling-size">Tumbling Window Size <span>(event count)</span><select id="config-tumbling-size" name="tumbling_size"><option value="5">5</option><option value="8">8</option><option value="10">10</option></select></label>
+              <label class="field-label" for="config-sliding-size">Sliding Window Size <span>(event count)</span><select id="config-sliding-size" name="sliding_size"><option value="5">5</option><option value="8">8</option><option value="10">10</option></select></label>
+              <label class="field-label" for="config-sliding-interval">Sliding Interval <span>(event count)</span><input id="config-sliding-interval" name="sliding_interval" type="number" min="1" step="1" required></label>
+            </div>
+            <button class="button-primary" type="submit">Apply Configuration</button>
+            <p id="window-config-feedback" class="feedback" role="status" aria-live="polite">Loading configuration…</p>
+          </form>
+        </section>
         <p id="aggregation-message" class="table-state">No simulation summaries have been stored yet.</p>
       </section>
     </section>
@@ -220,6 +234,6 @@
     <footer class="page-footer"><a href="/">← Return to Streaming Lab</a><span>Refreshes from the existing API every 5 seconds while this view is open</span></footer>
   </main>
 
-  <script src="app.js?v=graph-simulation-1"></script>
+  <script src="app.js?v=window-config-1"></script>
 </body>
 </html>

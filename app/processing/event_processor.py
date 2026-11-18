@@ -208,7 +208,9 @@ class LibraryEventProcessor:
                 result["sliding"] = sliding_metrics
             if tumbling_metrics is not None:
                 result["tumbling"] = tumbling_metrics
-            if self.run_id is None and self.simulation_id is None:
+            # Dashboard simulations still run the live window configuration;
+            # only experiment runs use an immutable configuration snapshot.
+            if self.run_id is None:
                 pending_configuration = await self._read_pending_configuration()
                 if tumbling_metrics is not None and pending_configuration is not None:
                     await self._activate_pending_configuration_at_boundary()

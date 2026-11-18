@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import app.main as main_module
+import app.messaging.rabbitmq as rabbitmq_module
 from app.main import create_app
 from app.messaging.rabbitmq import RabbitMQError, RabbitMQPublisher, RabbitMQSettings, RabbitMQPublishError
 from app.processing.metrics import Metrics
@@ -20,6 +21,30 @@ from app.storage.redis_metrics import (
 )
 
 
+@pytest.mark.asyncio
+async def test_queue_inspection_reads_unacknowledged_count_from_management_api(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return b'{"messages_unacknowledged":7}'
+
+    requests = []
+    monkeypatch.setattr(rabbitmq_module.urllib.request, "urlopen",
+                        lambda request, timeout: (requests.append((request, timeout)) or Response()))
+    publisher = RabbitMQPublisher(RabbitMQSettings("amqps://user:secret@rabbit-host/vh"))
+
+    assert await publisher._inspect_unacknowledged() == 7
+    request, timeout = requests[0]
+    assert request.full_url == "https://rabbit-host:443/api/queues/vh/streampulse.events"
+    assert request.get_header("Authorization").startswith("Basic ")
+    assert timeout == 2
+
+
 def test_frontend_root_and_static_assets_are_served():
     with TestClient(create_app(publisher=FakePublisher(), metrics_store=FakeMetricsStore())) as client:
         page = client.get("/")
@@ -27,8 +52,10 @@ def test_frontend_root_and_static_assets_are_served():
         script = client.get("/static/app.js")
 
     assert page.status_code == 200
-    assert 'href="styles.css?v=graph-analysis-1"' in page.text
-    assert 'src="app.js?v=graph-simulation-1"' in page.text
+    assert 'href="styles.css?v=window-config-1"' in page.text
+    assert 'src="app.js?v=window-config-1"' in page.text
+    assert 'id="window-config-form"' in page.text
+    assert 'id="pending-window-config"' in page.text
     assert "Experiments" not in page.text
     assert 'href="/failure-recovery"' in page.text
     assert 'id="nav-graph" href="/#graph-analysis"' in page.text
@@ -619,7 +646,8 @@ def test_recent_events_are_bounded_to_configured_limit():
 
 
 def test_monitoring_endpoint_reports_running_consumer_and_supported_queue_information():
-    publisher = FakePublisher(queue_info={"messages_ready": 6, "consumer_count": 1})
+    publisher = FakePublisher(queue_info={"messages_ready": 6, "consumer_count": 1,
+                                          "messages_unacknowledged": 4})
     evidence = datetime.now(timezone.utc).isoformat()
     snapshot = make_consumer_snapshot()
     store = FakeMetricsStore(monitoring_snapshot=snapshot, heartbeat_fresh=True,
@@ -638,8 +666,8 @@ def test_monitoring_endpoint_reports_running_consumer_and_supported_queue_inform
     assert data["rabbitmq"]["queue_name"] == "streampulse.events"
     assert data["rabbitmq"]["messages_ready"] == 6
     assert data["rabbitmq"]["consumer_count"] == 1
-    assert data["rabbitmq"]["unacknowledged_messages"] is None
-    assert data["rabbitmq"]["unacknowledged_status"] == "unavailable"
+    assert data["rabbitmq"]["unacknowledged_messages"] == 4
+    assert data["rabbitmq"]["unacknowledged_status"] == "available"
     assert data["consumer"] == {
         "status": "running",
         "reason": None,
