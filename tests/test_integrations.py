@@ -2006,8 +2006,11 @@ async def test_simulation_engine_consumer_and_status_share_simulation_scoped_sum
                 consumer_successes=successes, consumer_failures=attempts - successes,
                 consumer_failure_rate=(attempts - successes) / attempts if attempts else None,
                 throughput_events_per_second=None, sample_count={},
-                average_latency_ms={}, p95_latency_ms={},
+                average_latency_ms={"consumer_processing_latency_ms": 2.0},
+                p95_latency_ms={},
                 consumer_unique_successes=successes, measurements_present=bool(attempts),
+                minimum_latency_ms={"consumer_processing_latency_ms": 1.0},
+                maximum_latency_ms={"consumer_processing_latency_ms": 3.0},
             )
 
         async def record_simulation_activity(
@@ -2064,6 +2067,9 @@ async def test_simulation_engine_consumer_and_status_share_simulation_scoped_sum
     assert status["simulation"]["simulation_id"] == simulation_id
     assert status["measurements"]["processed"] == 5
     assert status["measurements"]["processing_failures"] == 0
+    assert status["measurements"]["average_latency_ms"]["consumer_processing_latency_ms"] == 2.0
+    assert status["measurements"]["minimum_latency_ms"]["consumer_processing_latency_ms"] == 1.0
+    assert status["measurements"]["maximum_latency_ms"]["consumer_processing_latency_ms"] == 3.0
     assert status["aggregations"]["tumbling"]["count"] == 5
     assert status["aggregations"]["sliding"]["count"] == 5
     assert status["aggregations"]["tumbling"]["sum"] > 0

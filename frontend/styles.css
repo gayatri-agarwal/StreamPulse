@@ -212,6 +212,59 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
 .analysis-point h3 { margin: 0 0 7px; color: var(--ink); font-size: 14px; }
 .analysis-point p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
 .accuracy-note { margin-bottom: 0; }
+.graph-page { max-width: 1280px; }
+.graph-view-switch { display: flex; width: fit-content; max-width: 100%; gap: 4px; margin: 0 0 16px; padding: 4px; border: 1px solid #dce5ec; border-radius: 11px; background: #edf2f6; }
+.graph-view-switch button { min-height: 38px; padding: 8px 16px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #637487; cursor: pointer; font: inherit; font-size: 13px; font-weight: 700; line-height: 1.25; text-align: center; transition: background-color .18s ease, border-color .18s ease, box-shadow .18s ease, color .18s ease; }
+.graph-view-switch button:hover:not([aria-selected="true"]) { background: #e3ebf2; color: var(--ink); }
+.graph-view-switch button[aria-selected="true"] { border-color: #e4eaf0; background: #fff; box-shadow: 0 1px 3px rgb(33 56 77 / 12%); color: #245477; }
+.graph-view-switch button:focus-visible { outline: 3px solid #78a9cf; outline-offset: 2px; }
+@media (max-width: 480px) {
+  .graph-view-switch { display: grid; width: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .graph-view-switch button { padding-inline: 8px; }
+}
+.graph-intro { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(260px, .72fr); align-items: center; gap: 30px; margin: 0 0 20px; padding: 25px 7px 20px; }
+.graph-intro h1 { font-size: clamp(35px, 4vw, 48px); }
+.graph-source-card { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: 0 8px 22px rgb(37 57 75 / 6%); }
+.graph-source-card strong { color: var(--ink); }
+.graph-source-card p { margin: 6px 0; color: var(--muted); font-size: 13px; }
+.graph-source-card small { color: var(--subtle); font-size: 12px; }
+.graph-panel { margin-bottom: 18px; padding: 22px; }
+.graph-state { display: flex; justify-content: space-between; gap: 12px; margin: -3px 0 15px; color: var(--muted); font-size: 13px; }
+.graph-kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+.graph-kpi { display: flex; min-width: 0; min-height: 112px; flex-direction: column; justify-content: space-between; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); }
+.graph-kpi span { color: var(--muted); font-size: 13px; }
+.graph-kpi strong { color: var(--ink); font-size: clamp(20px, 2.5vw, 29px); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.graph-empty { margin: 0; color: var(--subtle); font-size: 13px; line-height: 1.45; }
+.graph-kpi-empty { grid-column: 1 / -1; padding: 0 2px; }
+.graph-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.graph-chart-card { min-width: 0; padding: 15px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
+.graph-chart-card h3 { margin: 0 0 4px; color: var(--ink); font-size: 16px; }
+.graph-chart-card > p { min-height: 38px; margin: 0 0 6px; color: var(--muted); font-size: 13px; line-height: 1.4; }
+.graph-chart-card svg { display: block; width: 100%; min-height: 230px; overflow: visible; }
+.graph-legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+.graph-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend-swatch { width: 10px; height: 10px; border-radius: 3px; background: var(--blue); }
+.legend-swatch.sliding { background: var(--teal); }
+.svg-grid { stroke: #e7edf1; stroke-width: 1; }
+.svg-axis { stroke: #aab8c4; stroke-width: 1; }
+.svg-tick { fill: #68798a; font-family: inherit; font-size: 11px; }
+.svg-bar { fill: var(--blue); }
+.svg-bar.sliding { fill: var(--teal); }
+.svg-trend-line { fill: none; stroke: var(--blue); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+.svg-trend-point { fill: var(--blue); stroke: #fff; stroke-width: 2; }
+.sliding-trend-chart .svg-trend-line { stroke: var(--teal); }
+.sliding-trend-chart .svg-trend-point { fill: var(--teal); }
+.graph-comparison-scroll { margin-top: 14px; overflow-x: auto; }
+.graph-table-wrap { margin-top: 14px; overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; }
+.graph-comparison { width: 100%; border-collapse: collapse; text-align: left; }
+.graph-comparison th { padding: 10px 12px; background: #f4f7f9; color: #536376; font-size: 12px; letter-spacing: .04em; }
+.graph-comparison td { padding: 11px 12px; border-top: 1px solid #e8edf1; color: #344356; font-size: 13px; font-variant-numeric: tabular-nums; }
+.graph-table { width: 100%; min-width: 570px; border-collapse: collapse; text-align: left; }
+.graph-table th { padding: 10px 12px; background: #f4f7f9; color: #536376; font-size: 12px; letter-spacing: .04em; white-space: nowrap; }
+.graph-table td { padding: 11px 12px; border-top: 1px solid #e8edf1; color: #344356; font-size: 13px; font-variant-numeric: tabular-nums; }
+.graph-trend-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.graph-trend-grid .graph-chart-card svg { min-height: 260px; }
+.graph-limitation { margin-top: 14px; }
 @media (max-width: 1220px) {
   .app-header { flex-wrap: wrap; gap: 10px 18px; }
   .service-strip { order: 3; width: 100%; justify-content: flex-start; }
@@ -223,7 +276,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
 }
 @media (max-width: 940px) {
   .page-shell { padding: 22px 20px; }
-  .hero-row, .failure-intro { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px 3px; }
+  .hero-row, .failure-intro, .graph-intro { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px 3px; }
   .purpose-card { max-width: 660px; }
   .lab-grid, .monitor-grid { grid-template-columns: minmax(0, 1fr); }
   .architecture-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -231,6 +284,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
   .failure-path { grid-template-columns: minmax(0, 1fr); }
   .failure-path > b { transform: rotate(90deg); justify-self: center; }
   .failure-path > span { min-height: 0; }
+  .graph-chart-grid, .graph-trend-grid { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 640px) {
   .app-header { position: static; padding: 13px 15px; }
@@ -240,11 +294,11 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
   .service-strip { order: 3; flex-wrap: wrap; }
   .service-chip { flex: 1 1 auto; justify-content: center; font-size: 12px; }
   .page-shell { padding: 17px 13px 20px; }
-  .hero-row, .failure-intro { margin-bottom: 12px; padding: 13px 1px; }
+  .hero-row, .failure-intro, .graph-intro { margin-bottom: 12px; padding: 13px 1px; }
   h1 { font-size: clamp(34px, 10vw, 44px); letter-spacing: -1.1px; }
   .hero-copy { font-size: 16px; }
   .purpose-card { padding: 14px; }
-  .architecture-panel, .mode-panel, .controls-panel, .activity-panel, .monitoring-panel, .windows-panel, .education-panel { padding: 16px 14px; }
+  .architecture-panel, .mode-panel, .controls-panel, .activity-panel, .monitoring-panel, .windows-panel, .education-panel, .graph-panel { padding: 16px 14px; }
   .section-heading h2 { font-size: 21px; }
   .architecture-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
   .architecture-flow { grid-template-columns: minmax(0, 1fr); gap: 10px; margin-left: 3px; padding-left: 13px; border-left: 2px solid #d8e3eb; }
@@ -268,6 +322,9 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
   .latency-grid, .window-results, .concept-grid { grid-template-columns: minmax(0, 1fr); }
   .window-result > p { min-height: 0; }
   .failure-analysis-content { grid-template-columns: minmax(0, 1fr); }
+  .graph-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .graph-kpi { min-height: 100px; padding: 11px; }
+  .graph-chart-card { padding: 12px; }
   .failure-accordion > summary { gap: 9px; padding: 12px; }
   .accordion-index { width: 34px; height: 34px; flex-basis: 34px; }
   .accordion-heading strong { font-size: 14px; }

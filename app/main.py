@@ -707,6 +707,44 @@ def create_app(*, publisher: Any = None, metrics_store: Any = None,
         except (ExperimentConflict, ValueError) as exc:
             raise_experiment_error(exc)
 
+    @application.get("/api/experiments/current")
+    async def current_experiment_metrics() -> Dict[str, Any]:
+        """Return isolated metrics for the active run, or the latest run after it ends."""
+        repository = application.state.experiment_store
+        experiments = await database_call(repository.list_experiments)
+        current = None
+        for experiment in experiments:
+            runs = await database_call(repository.list_runs, experiment["experiment_id"])
+            if current is None and runs:
+                current = {"experiment": experiment, "run": runs[0]}
+            running_run = next((run for run in runs if run["status"] == RunStatus.RUNNING.value), None)
+            if running_run is not None:
+                current = {"experiment": experiment, "run": running_run}
+                break
+        if current is None:
+            return {"current": None, "measurements": None, "aggregations": None}
+
+        run_id = current["run"]["run_id"]
+        store = application.state.metrics_store
+        measurements = None
+        read_measurements = getattr(store, "get_measurement_summary", None)
+        if callable(read_measurements):
+            try:
+                measurements = asdict(await read_measurements(run_id))
+            except Exception:
+                pass
+        aggregations = {}
+        read_run_metrics = getattr(store, "get_run_metrics", None)
+        for window_type in ("tumbling", "sliding"):
+            summary = None
+            if callable(read_run_metrics):
+                try:
+                    summary = await read_run_metrics(run_id, window_type)
+                except Exception:
+                    pass
+            aggregations[window_type] = _metrics_data(summary)
+        return {"current": current, "measurements": measurements, "aggregations": aggregations}
+
     @application.get("/api/experiments")
     async def list_experiments() -> Dict[str, Any]:
         experiments = await database_call(application.state.experiment_store.list_experiments)

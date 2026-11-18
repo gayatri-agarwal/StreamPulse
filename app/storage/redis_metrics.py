@@ -323,6 +323,8 @@ class RedisMetricsStore:
             sample_count={key: len(value) for key, value in decoded.items()},
             average_latency_ms={key: average_latency(value) for key, value in decoded.items()},
             p95_latency_ms={key: percentile_95(value) for key, value in decoded.items()},
+            minimum_latency_ms={key: min(value) if value else None for key, value in decoded.items()},
+            maximum_latency_ms={key: max(value) if value else None for key, value in decoded.items()},
             consumer_unique_successes=counts.get("consumer_unique_successes", 0),
             inter_arrival_rate_events_per_second=throughput,
             measurements_present=bool(counts) or any(decoded.values()) or bool(timestamps),

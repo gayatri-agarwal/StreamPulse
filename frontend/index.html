@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#eef2f5">
   <meta name="description" content="An interactive laboratory for observing streaming event flows, queues, consumers, and event-count windows.">
   <title>StreamPulse | Interactive Streaming Systems Lab</title>
-  <link rel="stylesheet" href="styles.css?v=phase5-lab-1">
+  <link rel="stylesheet" href="styles.css?v=graph-analysis-1">
 </head>
 <body>
   <header class="app-header">
@@ -17,6 +17,7 @@
     <nav class="main-nav" aria-label="Main navigation">
       <a id="nav-lab" href="/" aria-current="page">Streaming Lab</a>
       <a id="nav-recovery" href="/failure-recovery">Failure &amp; Recovery</a>
+      <a id="nav-graph" href="/#graph-analysis">Graph Analysis</a>
     </nav>
     <div class="service-strip" aria-label="Live service status">
       <span id="api-status" class="service-chip is-checking"><i></i><span>API checking</span></span>
@@ -154,6 +155,71 @@
     <footer class="page-footer"><a href="/">← Return to Streaming Lab</a><span>Reference only · no failure simulation is run here</span></footer>
   </main>
 
-  <script src="app.js?v=phase5-lab-1"></script>
+  <main id="graph-page" class="page-shell graph-page" hidden>
+    <section class="graph-intro">
+      <div><p class="kicker">LIVE AGGREGATION ANALYSIS</p><h1>Graph <span>Analysis</span></h1><p class="hero-copy">Consumer processing latency and the latest tumbling/sliding summaries from StreamPulse.</p></div>
+      <aside class="graph-source-card"><strong id="graph-data-state">Waiting for metrics</strong><p id="graph-updated">No data read yet.</p><small>Sources: <code>/api/measurements</code> and <code>/api/metrics</code></small></aside>
+    </section>
+
+    <div class="graph-view-switch" role="tablist" aria-label="Graph metric scope">
+      <button type="button" role="tab" id="overall-metrics-tab" aria-controls="overall-metrics-view" aria-selected="true">Overall Retained Metrics</button>
+      <button type="button" role="tab" id="current-experiment-tab" aria-controls="current-experiment-view" aria-selected="false">Current Experiment</button>
+    </div>
+    <div id="overall-metrics-view" role="tabpanel" aria-labelledby="overall-metrics-tab">
+    <section class="panel graph-panel" aria-labelledby="processing-metrics-heading">
+      <div class="section-heading"><div><p class="kicker">01 · PROCESSING METRICS</p><h2 id="processing-metrics-heading">Overall Retained Metrics</h2></div><span class="subtle-label">Milliseconds · actual retained samples</span></div>
+      <div class="graph-kpi-grid">
+        <article class="graph-kpi"><span>Average latency</span><strong id="graph-processing-average">Unavailable</strong><small>Consumer callback mean</small></article>
+        <article class="graph-kpi"><span>Minimum latency</span><strong id="graph-processing-minimum">Unavailable</strong><small>From retained latency samples</small></article>
+        <article class="graph-kpi"><span>Maximum latency</span><strong id="graph-processing-maximum">Unavailable</strong><small>From retained latency samples</small></article>
+        <article class="graph-kpi"><span>Total processed events</span><strong id="graph-processed-total">Unavailable</strong><small>Unique successful deliveries</small></article>
+      </div>
+      <p id="graph-processing-empty" class="graph-empty" hidden>No consumer processing samples are available yet.</p>
+    </section>
+
+    <section class="panel graph-panel" aria-labelledby="window-comparison-heading">
+      <div class="section-heading"><div><p class="kicker">02 · TUMBLING VS SLIDING</p><h2 id="window-comparison-heading">Latest window summary comparison</h2></div><span class="event-count-tag">LATEST SUMMARY</span></div>
+      <p class="section-intro">Bars use the latest actual Redis summaries. Average, minimum, and maximum are window aggregates of each event’s numeric value; consumer processing latency is shown above.</p>
+      <div class="graph-chart-grid">
+        <article class="graph-chart-card"><h3>Events in latest summary</h3><p>Window count compared directly.</p><div class="graph-svg-wrap"><svg id="graph-window-count-chart" role="img" aria-label="Grouped tumbling and sliding window counts" viewBox="0 0 720 250"></svg></div><p id="graph-window-count-empty" class="graph-empty">No window summaries are available.</p></article>
+        <article class="graph-chart-card"><h3>Window value statistics</h3><p>Average, minimum, and maximum of event values.</p><div class="graph-svg-wrap"><svg id="graph-window-latency-chart" role="img" aria-label="Grouped tumbling and sliding event value statistics" viewBox="0 0 720 300"></svg></div><p id="graph-window-latency-empty" class="graph-empty">No window summaries are available.</p></article>
+      </div>
+      <div class="graph-table-wrap"><table class="graph-table"><thead><tr><th>Window</th><th>Events</th><th>Average value</th><th>Minimum value</th><th>Maximum value</th></tr></thead><tbody id="graph-comparison-body"></tbody></table></div>
+    </section>
+
+    <section class="panel graph-panel" aria-labelledby="aggregation-trends-heading">
+      <div class="section-heading"><div><p class="kicker">03 · AGGREGATION TRENDS</p><h2 id="aggregation-trends-heading">Observed average across summary updates</h2></div><span class="subtle-label">Session-only observations</span></div>
+      <p class="section-intro">The current API returns only the latest summary, not durable window history. These lines show the observed average event value in distinct snapshots while this view is open; identical consecutive windows cannot be distinguished by the API.</p>
+      <div class="graph-chart-grid">
+        <article class="graph-chart-card"><h3>Tumbling average event value</h3><div class="graph-svg-wrap"><svg id="graph-tumbling-trend-chart" role="img" aria-label="Observed tumbling average event value snapshots" viewBox="0 0 720 300"></svg></div><p id="graph-tumbling-trend-empty" class="graph-empty">No tumbling summary updates have been observed.</p></article>
+        <article class="graph-chart-card"><h3>Sliding average event value</h3><div class="graph-svg-wrap"><svg id="graph-sliding-trend-chart" class="sliding-trend-chart" role="img" aria-label="Observed sliding average event value snapshots" viewBox="0 0 720 300"></svg></div><p id="graph-sliding-trend-empty" class="graph-empty">No sliding summary updates have been observed.</p></article>
+      </div>
+    </section>
+    </div>
+    <div id="current-experiment-view" role="tabpanel" aria-labelledby="current-experiment-tab" hidden>
+      <section class="panel graph-panel" aria-labelledby="current-experiment-heading">
+        <div class="section-heading"><div><p class="kicker">CURRENT SIMULATION · ISOLATED METRICS</p><h2 id="current-experiment-heading">Current Simulation</h2></div><span id="current-experiment-label" class="subtle-label">No simulation started</span></div>
+        <p id="current-experiment-empty" class="graph-empty">Start a Streaming Lab simulation to see its run-scoped metrics here.</p>
+        <div class="graph-kpi-grid">
+          <article class="graph-kpi"><span>Successfully processed</span><strong id="current-processed-count">0</strong><small>Unique successful events</small></article>
+          <article class="graph-kpi"><span>Failed events</span><strong id="current-failed-count">0</strong><small>Failed consumer attempts</small></article>
+          <article class="graph-kpi"><span>Average processing latency</span><strong id="current-latency-average">Unavailable</strong><small>Milliseconds</small></article>
+          <article class="graph-kpi"><span>Minimum processing latency</span><strong id="current-latency-minimum">Unavailable</strong><small>Milliseconds</small></article>
+          <article class="graph-kpi"><span>Maximum processing latency</span><strong id="current-latency-maximum">Unavailable</strong><small>Milliseconds</small></article>
+        </div>
+      </section>
+      <section class="panel graph-panel" aria-labelledby="current-windows-heading">
+        <div class="section-heading"><div><p class="kicker">CURRENT RUN · WINDOW SUMMARIES</p><h2 id="current-windows-heading">Tumbling and sliding</h2></div></div>
+        <p class="section-intro">Summaries are read from this run’s Redis keys only.</p>
+        <div class="graph-chart-grid">
+          <article class="graph-chart-card"><h3>Window event counts</h3><div class="graph-svg-wrap"><svg id="current-window-count-chart" role="img" aria-label="Current simulation tumbling and sliding event counts" viewBox="0 0 720 250"></svg></div><p id="current-window-count-empty" class="graph-empty">No window summary has been produced for this simulation yet.</p></article>
+          <article class="graph-chart-card"><h3>Window value summaries</h3><div class="graph-svg-wrap"><svg id="current-window-value-chart" role="img" aria-label="Current simulation tumbling and sliding average, minimum, and maximum event values" viewBox="0 0 720 300"></svg></div><p id="current-window-value-empty" class="graph-empty">No window summary has been produced for this simulation yet.</p></article>
+        </div>
+      </section>
+    </div>
+    <footer class="page-footer"><a href="/">← Return to Streaming Lab</a><span>Refreshes from the existing API every 5 seconds while this view is open</span></footer>
+  </main>
+
+  <script src="app.js?v=graph-simulation-1"></script>
 </body>
 </html>

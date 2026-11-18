@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from app.experiments.schemas import RunStatus
 from app.experiments.store import ExperimentRepository
 from app.messaging.rabbitmq import RabbitMQConsumer, RabbitMQSettings, _event_json
 from app.processing.measurements import average_latency, failure_rate, percentile_95
+from app.processing.metrics import Metrics
 from app.schemas import LibraryEvent
 from app.storage.redis_metrics import (
     MEASUREMENT_SAMPLE_LIMIT,
@@ -51,6 +53,8 @@ async def test_duplicate_deliveries_count_attempts_but_unique_success_and_sample
     assert summary.consumer_successes == 2
     assert summary.consumer_unique_successes == 1
     assert summary.sample_count["consumer_processing_latency_ms"] == 1
+    assert summary.minimum_latency_ms["consumer_processing_latency_ms"] == 4.0
+    assert summary.maximum_latency_ms["consumer_processing_latency_ms"] == 4.0
     assert summary.inter_arrival_rate_events_per_second is None
     assert summary.throughput_events_per_second == summary.inter_arrival_rate_events_per_second
     assert len(client.lists[f"{store.measurement_prefix(run_id)}:success_timestamps"]) == 1
@@ -348,6 +352,8 @@ async def test_measurements_are_isolated_bounded_and_expire():
     )
     assert a.publish_successes == 1 and a.consumer_successes == 2
     assert a.average_latency_ms["consumer_processing_latency_ms"] == 8
+    assert a.minimum_latency_ms["consumer_processing_latency_ms"] == 7
+    assert a.maximum_latency_ms["consumer_processing_latency_ms"] == 9
     assert a.throughput_events_per_second == 0.5
     assert b.publish_failure_rate == 1
     assert b.consumer_attempts == 0
@@ -533,6 +539,58 @@ def test_measurements_endpoint_exposes_overall_and_run_scoped_summaries():
     assert scoped.status_code == 200 and scoped.json()["run_id"] == run_id
     assert scoped.json()["p95_latency_ms"]["publish_latency_ms"] == 2.5
     assert invalid.status_code == 422
+
+
+def test_current_experiment_metrics_are_scoped_to_the_active_run(tmp_path):
+    class Store:
+        def __init__(self):
+            self.measurement_runs = []
+
+        async def get_measurement_summary(self, run_id=None):
+            self.measurement_runs.append(run_id)
+            return MeasurementSummary(
+                0, 0, 0, None, 1, 1, 0, 0.0, None,
+                {"consumer_processing_latency_ms": 1},
+                {"consumer_processing_latency_ms": 4.0},
+                {"consumer_processing_latency_ms": 4.0},
+                consumer_unique_successes=1,
+                measurements_present=True,
+                minimum_latency_ms={"consumer_processing_latency_ms": 4.0},
+                maximum_latency_ms={"consumer_processing_latency_ms": 4.0},
+            )
+
+        async def get_run_metrics(self, run_id, window_type):
+            return Metrics(2, 4.0, 2.0, 1.0, 3.0)
+
+    store = Store()
+    with TestClient(create_app(
+        metrics_store=store, experiment_db_path=tmp_path / "current-experiment.sqlite3",
+    )) as client:
+        assert client.get("/api/experiments/current").json()["current"] is None
+        experiment = client.post("/api/experiments", json={"name": "Current"}).json()
+        run = client.post(
+            f"/api/experiments/{experiment['experiment_id']}/runs", json={}
+        ).json()
+        client.post(
+            f"/api/experiments/{experiment['experiment_id']}/runs/{run['run_id']}/start"
+        )
+        response = client.get("/api/experiments/current")
+        assert response.json()["current"]["run"]["status"] == RunStatus.RUNNING.value
+        with sqlite3.connect(tmp_path / "current-experiment.sqlite3") as connection:
+            connection.execute(
+                "UPDATE experiment_runs SET status = ? WHERE run_id = ?",
+                (RunStatus.COMPLETED.value, run["run_id"]),
+            )
+        response = client.get("/api/experiments/current")
+
+    assert response.status_code == 200
+    assert response.json()["current"]["run"]["run_id"] == run["run_id"]
+    assert response.json()["current"]["run"]["status"] == RunStatus.COMPLETED.value
+    assert store.measurement_runs == [run["run_id"], run["run_id"]]
+    assert response.json()["measurements"]["consumer_unique_successes"] == 1
+    assert response.json()["aggregations"]["tumbling"] == {
+        "count": 2, "sum": 4.0, "average": 2.0, "minimum": 1.0, "maximum": 3.0,
+    }
 
 
 @pytest.mark.asyncio

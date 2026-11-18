@@ -1,6 +1,6 @@
 """Measurement calculations shared by live monitoring and future experiment runs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Iterable, Optional
 
@@ -46,4 +46,6 @@ class MeasurementSummary:
     consumer_unique_successes: int = 0
     inter_arrival_rate_events_per_second: Optional[float] = None
     measurements_present: bool = False
+    minimum_latency_ms: dict = field(default_factory=dict)
+    maximum_latency_ms: dict = field(default_factory=dict)
 

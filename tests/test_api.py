@@ -27,10 +27,14 @@ def test_frontend_root_and_static_assets_are_served():
         script = client.get("/static/app.js")
 
     assert page.status_code == 200
-    assert 'href="/static/styles.css?v=phase5-lab-1"' in page.text
-    assert 'src="/static/app.js?v=phase5-lab-1"' in page.text
+    assert 'href="styles.css?v=graph-analysis-1"' in page.text
+    assert 'src="app.js?v=graph-simulation-1"' in page.text
     assert "Experiments" not in page.text
     assert 'href="/failure-recovery"' in page.text
+    assert 'id="nav-graph" href="/#graph-analysis"' in page.text
+    assert 'id="graph-page" class="page-shell graph-page" hidden' in page.text
+    assert 'id="graph-window-count-chart"' in page.text
+    assert 'id="graph-tumbling-trend-chart"' in page.text
     assert stylesheet.status_code == 200
     assert script.status_code == 200
 

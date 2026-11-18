@@ -163,6 +163,8 @@ class SimulationEngine:
                     "processing_failures": summary.consumer_failures,
                     "throughput_events_per_second": summary.throughput_events_per_second,
                     "average_latency_ms": summary.average_latency_ms,
+                    "minimum_latency_ms": summary.minimum_latency_ms,
+                    "maximum_latency_ms": summary.maximum_latency_ms,
                     "p95_latency_ms": summary.p95_latency_ms,
                 }
         except Exception:

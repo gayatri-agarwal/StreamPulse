@@ -24,8 +24,10 @@ const MODE_COPY = {
 const elements = {
   labPage: document.getElementById("lab-page"),
   failurePage: document.getElementById("failure-page"),
+  graphPage: document.getElementById("graph-page"),
   navLab: document.getElementById("nav-lab"),
   navRecovery: document.getElementById("nav-recovery"),
+  navGraph: document.getElementById("nav-graph"),
   apiStatus: document.getElementById("api-status"),
   rabbitStatus: document.getElementById("rabbit-status"),
   redisStatus: document.getElementById("redis-status"),
@@ -60,11 +62,48 @@ const elements = {
   publishLatency: document.getElementById("publish-latency"),
   processingLatency: document.getElementById("processing-latency"),
   aggregationMessage: document.getElementById("aggregation-message"),
+  graphDataState: document.getElementById("graph-data-state"),
+  graphUpdated: document.getElementById("graph-updated"),
+  graphProcessingAverage: document.getElementById("graph-processing-average"),
+  graphProcessingMinimum: document.getElementById("graph-processing-minimum"),
+  graphProcessingMaximum: document.getElementById("graph-processing-maximum"),
+  graphProcessedTotal: document.getElementById("graph-processed-total"),
+  graphProcessingEmpty: document.getElementById("graph-processing-empty"),
+  graphWindowCountChart: document.getElementById("graph-window-count-chart"),
+  graphWindowCountEmpty: document.getElementById("graph-window-count-empty"),
+  graphWindowLatencyChart: document.getElementById("graph-window-latency-chart"),
+  graphWindowLatencyEmpty: document.getElementById("graph-window-latency-empty"),
+  graphComparisonBody: document.getElementById("graph-comparison-body"),
+  graphTumblingTrendChart: document.getElementById("graph-tumbling-trend-chart"),
+  graphTumblingTrendEmpty: document.getElementById("graph-tumbling-trend-empty"),
+  graphSlidingTrendChart: document.getElementById("graph-sliding-trend-chart"),
+  graphSlidingTrendEmpty: document.getElementById("graph-sliding-trend-empty"),
+  overallMetricsView: document.getElementById("overall-metrics-view"),
+  currentExperimentView: document.getElementById("current-experiment-view"),
+  overallMetricsTab: document.getElementById("overall-metrics-tab"),
+  currentExperimentTab: document.getElementById("current-experiment-tab"),
+  currentExperimentLabel: document.getElementById("current-experiment-label"),
+  currentExperimentEmpty: document.getElementById("current-experiment-empty"),
+  currentProcessedCount: document.getElementById("current-processed-count"),
+  currentFailedCount: document.getElementById("current-failed-count"),
+  currentLatencyAverage: document.getElementById("current-latency-average"),
+  currentLatencyMinimum: document.getElementById("current-latency-minimum"),
+  currentLatencyMaximum: document.getElementById("current-latency-maximum"),
+  currentWindowCountChart: document.getElementById("current-window-count-chart"),
+  currentWindowCountEmpty: document.getElementById("current-window-count-empty"),
+  currentWindowValueChart: document.getElementById("current-window-value-chart"),
+  currentWindowValueEmpty: document.getElementById("current-window-value-empty"),
 };
 
 let selectedMode = "steady";
 let simulation = null;
 let simulationStatus = null;
+let graphMetrics = null;
+let graphMeasurements = null;
+let graphMonitoring = null;
+let currentSimulationData = null;
+const graphTrendHistory = { tumbling: [], sliding: [] };
+const graphTrendMarkers = { tumbling: null, sliding: null };
 let monitoring = null;
 let health = null;
 let pollTimer = null;
@@ -74,13 +113,19 @@ let actionInFlight = false;
 let lastActivityError = null;
 
 function currentPage() {
-  const failure = window.location.pathname.replace(/\/+$/, "") === "/failure-recovery";
-  elements.labPage.hidden = failure;
-  elements.failurePage.hidden = !failure;
-  elements.navLab.removeAttribute("aria-current");
-  elements.navRecovery.removeAttribute("aria-current");
-  (failure ? elements.navRecovery : elements.navLab).setAttribute("aria-current", "page");
-  return failure ? "recovery" : "lab";
+  const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
+  const page = pathname === "/failure-recovery" ? "recovery"
+    : window.location.hash === "#graph-analysis" ? "graph" : "lab";
+  elements.labPage.hidden = page !== "lab";
+  elements.failurePage.hidden = page !== "recovery";
+  elements.graphPage.hidden = page !== "graph";
+  for (const link of [elements.navLab, elements.navRecovery, elements.navGraph]) {
+    link.removeAttribute("aria-current");
+  }
+  const activeLink = page === "recovery" ? elements.navRecovery
+    : page === "graph" ? elements.navGraph : elements.navLab;
+  activeLink.setAttribute("aria-current", "page");
+  return page;
 }
 
 function formatValue(value, suffix = "") {
@@ -328,6 +373,227 @@ function renderAggregations() {
   }
 }
 
+function svgElement(name, attributes = {}, label = null) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+  if (label !== null) node.textContent = String(label);
+  return node;
+}
+
+function renderGroupedBars(svg, emptyMessage, rows) {
+  const usable = rows.filter((row) => Number.isFinite(row.tumbling) || Number.isFinite(row.sliding));
+  svg.replaceChildren();
+  const hasData = usable.length > 0;
+  svg.hidden = !hasData;
+  emptyMessage.hidden = hasData;
+  if (!hasData) return;
+
+  const width = 720;
+  const top = 42;
+  const plotLeft = 190;
+  const plotWidth = 430;
+  const rowHeight = Math.min(70, Math.max(54, Math.floor(190 / usable.length)));
+  const height = top + usable.length * rowHeight + 16;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  const maxValue = Math.max(0, ...usable.flatMap((row) => [row.tumbling, row.sliding]
+    .filter((value) => Number.isFinite(value))));
+  const scaleMaximum = maxValue > 0 ? maxValue : 1;
+  const colors = { tumbling: "#386c93", sliding: "#19877f" };
+  const legend = [
+    { key: "tumbling", label: "Tumbling", x: plotLeft },
+    { key: "sliding", label: "Sliding", x: plotLeft + 130 },
+  ];
+  for (const item of legend) {
+    svg.append(
+      svgElement("rect", { x: item.x, y: 12, width: 10, height: 10, rx: 2, fill: colors[item.key] }),
+      svgElement("text", { x: item.x + 16, y: 21, class: "svg-legend-label" }, item.label),
+    );
+  }
+  svg.append(svgElement("line", { x1: plotLeft, y1: top - 5, x2: plotLeft, y2: height - 10, class: "svg-axis" }));
+
+  usable.forEach((row, index) => {
+    const y = top + index * rowHeight;
+    svg.append(svgElement("text", { x: plotLeft - 12, y: y + 26, "text-anchor": "end", class: "svg-category" }, row.label));
+    for (const [seriesIndex, key] of ["tumbling", "sliding"].entries()) {
+      const value = row[key];
+      if (!Number.isFinite(value)) continue;
+      const barY = y + 5 + seriesIndex * 22;
+      const barWidth = Math.max(0, plotWidth * value / scaleMaximum);
+      svg.append(
+        svgElement("rect", { x: plotLeft, y: barY, width: barWidth, height: 15, rx: 4, fill: colors[key] }),
+        svgElement("text", {
+          x: Math.min(width - 12, plotLeft + barWidth + 8), y: barY + 12,
+          class: "svg-value", "text-anchor": plotLeft + barWidth > width - 45 ? "end" : "start",
+        }, formatValue(value)),
+      );
+    }
+    if (index < usable.length - 1) {
+      svg.append(svgElement("line", { x1: 12, y1: y + rowHeight - 3, x2: width - 12, y2: y + rowHeight - 3, class: "svg-grid" }));
+    }
+  });
+}
+
+function renderLineChart(svg, emptyMessage, points) {
+  const usable = points.filter((point) => Number.isFinite(point.value));
+  svg.replaceChildren();
+  const hasData = usable.length > 0;
+  svg.hidden = !hasData;
+  emptyMessage.hidden = hasData;
+  if (!hasData) return;
+
+  const width = 720;
+  const height = 300;
+  const left = 58;
+  const right = 24;
+  const top = 24;
+  const bottom = 48;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const values = usable.map((point) => point.value);
+  const rawMin = Math.min(...values);
+  const rawMax = Math.max(...values);
+  const padding = rawMax === rawMin ? Math.max(Math.abs(rawMax) * 0.1, 1) : (rawMax - rawMin) * 0.12;
+  const minValue = rawMin - padding;
+  const maxValue = rawMax + padding;
+  const coordinates = usable.map((point, index) => ({
+    ...point,
+    x: usable.length === 1 ? left + plotWidth / 2 : left + (index / (usable.length - 1)) * plotWidth,
+    y: top + ((maxValue - point.value) / (maxValue - minValue)) * plotHeight,
+  }));
+
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  for (let tick = 0; tick <= 4; tick += 1) {
+    const y = top + (tick / 4) * plotHeight;
+    const value = maxValue - (tick / 4) * (maxValue - minValue);
+    svg.append(
+      svgElement("line", { x1: left, y1: y, x2: width - right, y2: y, class: "svg-grid" }),
+      svgElement("text", { x: left - 9, y: y + 4, "text-anchor": "end", class: "svg-tick" }, formatValue(value)),
+    );
+  }
+  svg.append(svgElement("line", { x1: left, y1: top + plotHeight, x2: width - right, y2: top + plotHeight, class: "svg-axis" }));
+  if (coordinates.length > 1) {
+    svg.append(svgElement("polyline", {
+      points: coordinates.map((point) => `${point.x},${point.y}`).join(" "),
+      class: "svg-trend-line",
+    }));
+  }
+  for (const point of coordinates) {
+    const marker = svgElement("circle", { cx: point.x, cy: point.y, r: 4.5, class: "svg-trend-point" });
+    marker.append(svgElement("title", {}, `${formatValue(point.value)} ms · ${point.label}`));
+    svg.append(marker);
+  }
+  const first = coordinates[0];
+  const last = coordinates[coordinates.length - 1];
+  svg.append(
+    svgElement("text", { x: left, y: height - 14, class: "svg-tick" }, first.label),
+    svgElement("text", { x: width - right, y: height - 14, "text-anchor": "end", class: "svg-tick" }, last.label),
+  );
+}
+
+function updateGraphTrend(name, summary) {
+  if (!summary || !Number.isFinite(summary.average)) return;
+  const completionAt = name === "tumbling"
+    ? graphMonitoring?.consumer?.windows?.tumbling?.last_completed_at : null;
+  const signature = JSON.stringify(summary);
+  const marker = `${completionAt || ""}:${signature}`;
+  if (graphTrendMarkers[name] === marker) return;
+  graphTrendMarkers[name] = marker;
+  const observedAt = completionAt || new Date().toISOString();
+  graphTrendHistory[name].push({ value: summary.average, label: formatTimestamp(observedAt) });
+  graphTrendHistory[name] = graphTrendHistory[name].slice(-50);
+}
+
+function renderGraphAnalysis() {
+  const measurements = graphMeasurements;
+  const processingSamples = measurements?.sample_count?.consumer_processing_latency_ms || 0;
+  const processingAverage = measurements?.average_latency_ms?.consumer_processing_latency_ms;
+  const processingMinimum = measurements?.minimum_latency_ms?.consumer_processing_latency_ms;
+  const processingMaximum = measurements?.maximum_latency_ms?.consumer_processing_latency_ms;
+  elements.graphProcessingAverage.textContent = formatValue(processingAverage, " ms");
+  elements.graphProcessingMinimum.textContent = formatValue(processingMinimum, " ms");
+  elements.graphProcessingMaximum.textContent = formatValue(processingMaximum, " ms");
+  elements.graphProcessedTotal.textContent = formatValue(measurements?.consumer_unique_successes);
+  elements.graphProcessingEmpty.hidden = processingSamples > 0;
+
+  const tumbling = graphMetrics?.tumbling;
+  const sliding = graphMetrics?.sliding;
+  renderGroupedBars(elements.graphWindowCountChart, elements.graphWindowCountEmpty, [{
+    label: "Latest summary", tumbling: tumbling?.count, sliding: sliding?.count,
+  }]);
+  renderGroupedBars(elements.graphWindowLatencyChart, elements.graphWindowLatencyEmpty, [
+    { label: "Average", tumbling: tumbling?.average, sliding: sliding?.average },
+    { label: "Minimum", tumbling: tumbling?.minimum, sliding: sliding?.minimum },
+    { label: "Maximum", tumbling: tumbling?.maximum, sliding: sliding?.maximum },
+  ]);
+
+  elements.graphComparisonBody.replaceChildren();
+  for (const [name, summary] of [["Tumbling", tumbling], ["Sliding", sliding]]) {
+    const row = document.createElement("tr");
+    row.append(
+      makeCell(name), makeCell(formatValue(summary?.count)),
+      makeCell(formatValue(summary?.average)), makeCell(formatValue(summary?.minimum)),
+      makeCell(formatValue(summary?.maximum)),
+    );
+    elements.graphComparisonBody.append(row);
+  }
+
+  updateGraphTrend("tumbling", tumbling);
+  updateGraphTrend("sliding", sliding);
+  renderLineChart(elements.graphTumblingTrendChart, elements.graphTumblingTrendEmpty, graphTrendHistory.tumbling);
+  renderLineChart(elements.graphSlidingTrendChart, elements.graphSlidingTrendEmpty, graphTrendHistory.sliding);
+
+  const hasAnyData = Boolean(measurements?.measurements_present || tumbling || sliding
+    || graphTrendHistory.tumbling.length || graphTrendHistory.sliding.length);
+  elements.graphDataState.textContent = hasAnyData ? "Live API data loaded" : "No metrics available yet";
+  elements.graphUpdated.textContent = graphMetrics !== null || graphMeasurements !== null
+    ? `Updated ${new Date().toLocaleTimeString()}` : "Metrics API unavailable.";
+}
+
+function renderCurrentSimulation() {
+  const data = currentSimulationData;
+  const simulationSession = data?.simulation;
+  const measurements = data?.measurements;
+  const aggregations = data?.aggregations;
+  const processed = measurements?.processed || 0;
+  const failed = measurements?.processing_failures || 0;
+  const modeLabel = MODE_COPY[simulationSession?.flow_mode]?.label || simulationSession?.flow_mode;
+  elements.currentExperimentLabel.textContent = simulationSession
+    ? `${modeLabel} · ${simulationSession.state} · ${simulationSession.simulation_id}` : "No simulation started";
+  elements.currentProcessedCount.textContent = formatValue(processed);
+  elements.currentFailedCount.textContent = formatValue(failed);
+  elements.currentLatencyAverage.textContent = formatValue(
+    measurements?.average_latency_ms?.consumer_processing_latency_ms, " ms");
+  elements.currentLatencyMinimum.textContent = formatValue(
+    measurements?.minimum_latency_ms?.consumer_processing_latency_ms, " ms");
+  elements.currentLatencyMaximum.textContent = formatValue(
+    measurements?.maximum_latency_ms?.consumer_processing_latency_ms, " ms");
+  const tumbling = aggregations?.tumbling;
+  const sliding = aggregations?.sliding;
+  const hasEvents = processed > 0 || failed > 0
+    || Number(tumbling?.count || 0) > 0 || Number(sliding?.count || 0) > 0;
+  elements.currentExperimentEmpty.hidden = hasEvents;
+  elements.currentExperimentEmpty.textContent = simulationSession
+    ? "No simulation data yet. Processed events and window summaries will appear here as they arrive."
+    : "Start a Streaming Lab simulation to see its run-scoped metrics here.";
+  const rows = [
+    { label: "Latest summary", tumbling: tumbling?.count, sliding: sliding?.count },
+  ];
+  renderGroupedBars(elements.currentWindowCountChart, elements.currentWindowCountEmpty, rows);
+  renderGroupedBars(elements.currentWindowValueChart, elements.currentWindowValueEmpty, [
+    { label: "Average", tumbling: tumbling?.average, sliding: sliding?.average },
+    { label: "Minimum", tumbling: tumbling?.minimum, sliding: sliding?.minimum },
+    { label: "Maximum", tumbling: tumbling?.maximum, sliding: sliding?.maximum },
+  ]);
+}
+
+function selectGraphView(view) {
+  const current = view === "current";
+  elements.overallMetricsView.hidden = current;
+  elements.currentExperimentView.hidden = !current;
+  elements.overallMetricsTab.setAttribute("aria-selected", String(!current));
+  elements.currentExperimentTab.setAttribute("aria-selected", String(current));
+}
+
 function makeCell(text, className = "") {
   const cell = document.createElement("td");
   if (className) cell.className = className;
@@ -470,12 +736,81 @@ async function refreshLiveData() {
 
 function scheduleRefresh() {
   window.clearTimeout(pollTimer);
-  if (document.hidden || currentPage() !== "lab") return;
+  if (document.hidden || !["lab", "graph"].includes(currentPage())) return;
   pollTimer = window.setTimeout(async () => {
-    await refreshLiveData();
+    if (currentPage() === "graph") await refreshGraphData();
+    else await refreshLiveData();
     scheduleRefresh();
   }, REFRESH_INTERVAL_MS);
 }
+
+async function refreshGraphData() {
+  if (pollInFlight || currentPage() !== "graph" || document.hidden) return;
+  pollInFlight = true;
+  try {
+    const [metrics, measurements, monitoringResult, healthResult, simulationResult] = await Promise.allSettled([
+      requestJson("/api/metrics"),
+      requestJson("/api/measurements"),
+      requestJson("/api/monitoring"),
+      requestJson("/api/health"),
+      requestJson("/api/simulations/status"),
+    ]);
+    graphMetrics = metrics.status === "fulfilled" ? metrics.value : null;
+    graphMeasurements = measurements.status === "fulfilled" ? measurements.value : null;
+    graphMonitoring = monitoringResult.status === "fulfilled" ? monitoringResult.value : null;
+    health = healthResult.status === "fulfilled" ? healthResult.value : null;
+    currentSimulationData = simulationResult.status === "fulfilled" ? simulationResult.value : null;
+    updateHeaderStatus();
+    renderGraphAnalysis();
+    renderCurrentSimulation();
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function activatePage() {
+  window.clearTimeout(pollTimer);
+  const page = currentPage();
+  if (page === "lab") {
+    renderMode(selectedMode);
+    updateSimulationControls();
+    void refreshLiveData().finally(scheduleRefresh);
+  } else if (page === "graph") {
+    renderGraphAnalysis();
+    void refreshGraphData().finally(scheduleRefresh);
+  } else {
+    void requestJson("/api/health").then((data) => {
+      health = data;
+      setServiceChip(elements.apiStatus, "API", data?.status);
+      setServiceChip(elements.rabbitStatus, "RabbitMQ", data?.services?.rabbitmq);
+      setServiceChip(elements.redisStatus, "Redis", data?.services?.redis);
+    }).catch(() => {
+      setServiceChip(elements.apiStatus, "API", "unavailable");
+      setServiceChip(elements.rabbitStatus, "RabbitMQ", "not_verified");
+      setServiceChip(elements.redisStatus, "Redis", "not_verified");
+    });
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const link = event.target.closest('a[href="/"] , a[href="/failure-recovery"], a[href="/#graph-analysis"]');
+  if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  const target = new URL(link.href, window.location.href);
+  if (target.pathname === "/failure-recovery") {
+    history.pushState({}, "", "/failure-recovery");
+  } else if (target.hash === "#graph-analysis") {
+    history.pushState({}, "", "/#graph-analysis");
+  } else {
+    history.pushState({}, "", "/");
+  }
+  activatePage();
+});
+
+window.addEventListener("popstate", activatePage);
+
+elements.overallMetricsTab.addEventListener("click", () => selectGraphView("overall"));
+elements.currentExperimentTab.addEventListener("click", () => selectGraphView("current"));
 
 function validateVisibleInputs() {
   const panel = document.querySelector(`.mode-fields[data-fields="${selectedMode}"]`);
@@ -558,32 +893,13 @@ elements.stopButton.addEventListener("click", async () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) window.clearTimeout(pollTimer);
-  else if (currentPage() === "lab") {
-    void refreshLiveData();
+  else if (["lab", "graph"].includes(currentPage())) {
+    if (currentPage() === "graph") void refreshGraphData();
+    else void refreshLiveData();
     scheduleRefresh();
   }
 });
 
 window.addEventListener("pagehide", () => window.clearTimeout(pollTimer));
 
-function initialize() {
-  const page = currentPage();
-  if (page === "lab") {
-    renderMode(selectedMode);
-    updateSimulationControls();
-    void refreshLiveData().finally(scheduleRefresh);
-  } else {
-    void requestJson("/api/health").then((data) => {
-      health = data;
-      setServiceChip(elements.apiStatus, "API", data?.status);
-      setServiceChip(elements.rabbitStatus, "RabbitMQ", data?.services?.rabbitmq);
-      setServiceChip(elements.redisStatus, "Redis", data?.services?.redis);
-    }).catch(() => {
-      setServiceChip(elements.apiStatus, "API", "unavailable");
-      setServiceChip(elements.rabbitStatus, "RabbitMQ", "not_verified");
-      setServiceChip(elements.redisStatus, "Redis", "not_verified");
-    });
-  }
-}
-
-initialize();
+activatePage();
